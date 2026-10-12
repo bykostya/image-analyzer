@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+import re
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +29,8 @@ PALETTE = (
 DPI_CHOICES = ("100", "200", "300", "400", "500", "600")
 LASSO_PREVIEW_OPACITY = 15
 VERTEX_MAGNET_RADIUS = 12
+PROJECT_FORMAT = "image-analyzer-project"
+PROJECT_VERSION = 1
 
 
 @dataclass
@@ -84,6 +89,184 @@ def make_annotated_image(image: Image.Image, regions: list[Region]) -> Image.Ima
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
+def make_region_export(
+    image: Image.Image,
+    regions: list[Region],
+    selected_indices: list[int],
+    include_intersections: bool = True,
+    crop_to_regions: bool = True,
+) -> Image.Image:
+    """Render selected regions on the source image, optionally cropping the result."""
+    selected_regions = [regions[index] for index in selected_indices]
+    result = make_annotated_image(image, selected_regions)
+    coverage = Image.new("L", image.size, 0)
+    for region in selected_regions:
+        mask = Image.new("L", image.size, 0)
+        if len(region.points) >= 3:
+            ImageDraw.Draw(mask).polygon(region.points, fill=1)
+        coverage = ImageChops.add(coverage, mask)
+
+    if not include_intersections:
+        overlap_mask = coverage.point(lambda value: 255 if value > 1 else 0)
+        result.paste(image.convert("RGB"), mask=overlap_mask)
+
+    if crop_to_regions:
+        bounds = coverage.point(lambda value: 255 if value else 0).getbbox()
+        if bounds is not None:
+            margin = max((region.border_width + 1) // 2 for region in selected_regions)
+            left, top, right, bottom = bounds
+            bounds = (
+                max(0, left - margin),
+                max(0, top - margin),
+                min(image.width, right + margin),
+                min(image.height, bottom + margin),
+            )
+            result = result.crop(bounds)
+    return result
+
+
+def save_project_file(
+    project_path: Path,
+    image_path: Path,
+    image: Image.Image,
+    regions: list[Region],
+    base_region_index: int | None,
+    dpi: int,
+    language: str,
+) -> None:
+    try:
+        image_reference = os.path.relpath(image_path.resolve(), project_path.parent.resolve())
+    except ValueError:
+        image_reference = str(image_path.resolve())
+    project = {
+        "format": PROJECT_FORMAT,
+        "version": PROJECT_VERSION,
+        "image": {
+            "path": image_reference,
+            "width": image.width,
+            "height": image.height,
+        },
+        "regions": [
+            {
+                "name": region.name,
+                "points": [[x, y] for x, y in region.points],
+                "color": region.color,
+                "opacity": region.opacity,
+                "border_width": region.border_width,
+            }
+            for region in regions
+        ],
+        "base_region_index": base_region_index,
+        "dpi": dpi,
+        "language": language,
+    }
+    project_path.write_text(
+        json.dumps(project, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_project_file(
+    project_path: Path,
+) -> tuple[Image.Image, Path, list[Region], int | None, int, str]:
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    if not isinstance(project, dict) or project.get("format") != PROJECT_FORMAT:
+        raise ValueError("Not an Image Analyzer project file.")
+    version = project.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != PROJECT_VERSION:
+        raise ValueError(f"Unsupported project version: {project.get('version')!r}")
+
+    image_data = project.get("image")
+    if not isinstance(image_data, dict) or not isinstance(image_data.get("path"), str):
+        raise ValueError("Project does not contain a valid source image path.")
+    image_width, image_height = image_data.get("width"), image_data.get("height")
+    if (
+        not isinstance(image_width, int)
+        or isinstance(image_width, bool)
+        or image_width <= 0
+        or not isinstance(image_height, int)
+        or isinstance(image_height, bool)
+        or image_height <= 0
+    ):
+        raise ValueError("Project contains invalid source image dimensions.")
+    image_path = Path(image_data["path"])
+    if not image_path.is_absolute():
+        image_path = project_path.parent / image_path
+    image_path = image_path.resolve()
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    expected_size = (image_width, image_height)
+    if expected_size != image.size:
+        raise ValueError("The source image dimensions do not match the project.")
+
+    region_data = project.get("regions")
+    if not isinstance(region_data, list):
+        raise ValueError("Project regions must be a list.")
+    regions = []
+    for item in region_data:
+        if not isinstance(item, dict):
+            raise ValueError("Project contains an invalid region.")
+        name = item.get("name")
+        color = item.get("color")
+        points = item.get("points")
+        opacity = item.get("opacity")
+        border_width = item.get("border_width")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(color, str)
+            or re.fullmatch(r"#[0-9a-fA-F]{6}", color) is None
+            or not isinstance(points, list)
+            or not isinstance(opacity, int)
+            or isinstance(opacity, bool)
+            or not 0 <= opacity <= 100
+            or not isinstance(border_width, int)
+            or isinstance(border_width, bool)
+            or not 1 <= border_width <= 12
+        ):
+            raise ValueError("Project contains invalid region settings.")
+        parsed_points: list[tuple[float, float]] = []
+        for point in points:
+            if (
+                not isinstance(point, list)
+                or len(point) != 2
+                or any(
+                    not isinstance(coordinate, (int, float))
+                    or isinstance(coordinate, bool)
+                    or (
+                        isinstance(coordinate, float)
+                        and not math.isfinite(coordinate)
+                    )
+                    for coordinate in point
+                )
+            ):
+                raise ValueError("Project contains invalid region coordinates.")
+            x, y = point
+            if not 0 <= x < image.width or not 0 <= y < image.height:
+                raise ValueError("Project contains coordinates outside the source image.")
+            parsed_points.append((float(x), float(y)))
+        if len(parsed_points) < 3:
+            raise ValueError("Project regions must contain at least three points.")
+        regions.append(
+            Region(name, parsed_points, color.lower(), opacity, border_width)
+        )
+
+    base_region_index = project.get("base_region_index")
+    if base_region_index is not None and (
+        not isinstance(base_region_index, int)
+        or isinstance(base_region_index, bool)
+        or not 0 <= base_region_index < len(regions)
+    ):
+        raise ValueError("Project contains an invalid base region.")
+    dpi = project.get("dpi", 300)
+    if not isinstance(dpi, int) or dpi not in {100, 200, 300, 400, 500, 600}:
+        raise ValueError("Project contains an invalid DPI value.")
+    language = project.get("language", "ru")
+    if not isinstance(language, str) or language not in {"ru", "sr", "en"}:
+        raise ValueError("Project contains an unsupported interface language.")
+    return image, image_path, regions, base_region_index, dpi, language
+
+
 class ImageAnalyzerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -95,12 +278,14 @@ class ImageAnalyzerApp:
 
         self.image: Image.Image | None = None
         self.image_path: Path | None = None
+        self.project_path: Path | None = None
         self.tk_image: ImageTk.PhotoImage | None = None
         self.regions: list[Region] = []
         self.selected_index: int | None = None
         self.selected_vertex: int | None = None
         self.dragging_vertex: int | None = None
         self.hovered_vertex: tuple[int, int] | None = None
+        self.suppress_vertex_hover = False
         self.delete_vertex_mode = False
         self.drawing = False
         self.lasso_points: list[tuple[float, float]] = []
@@ -149,6 +334,12 @@ class ImageAnalyzerApp:
         toolbar.pack(side=tk.TOP, fill=tk.X)
         self._button(toolbar, "load_image", command=self.load_image).pack(
             side=tk.LEFT, padx=(0, 6)
+        )
+        self._button(toolbar, "open_project", command=self.open_project).pack(
+            side=tk.LEFT, padx=6
+        )
+        self._button(toolbar, "save_project", command=self.save_project).pack(
+            side=tk.LEFT, padx=6
         )
         self._button(toolbar, "new_lasso", command=self.start_lasso).pack(
             side=tk.LEFT, padx=6
@@ -269,7 +460,22 @@ class ImageAnalyzerApp:
         canvas_frame = ttk.Frame(body)
         body.add(canvas_frame, weight=1)
         self.canvas = tk.Canvas(canvas_frame, background="#252525", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.horizontal_scrollbar = ttk.Scrollbar(
+            canvas_frame,
+            orient=tk.HORIZONTAL,
+            command=lambda *args: self._scroll_view("x", *args),
+        )
+        self.vertical_scrollbar = ttk.Scrollbar(
+            canvas_frame,
+            orient=tk.VERTICAL,
+            command=lambda *args: self._scroll_view("y", *args),
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        ttk.Frame(canvas_frame).grid(row=1, column=1)
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
 
         ttk.Label(
             self.root,
@@ -330,6 +536,7 @@ class ImageAnalyzerApp:
 
         self.image = loaded
         self.image_path = Path(path)
+        self.project_path = None
         self.regions.clear()
         self.delete_vertex_mode = False
         self._update_delete_vertex_button()
@@ -358,6 +565,95 @@ class ImageAnalyzerApp:
             )
         )
 
+    def save_project(self) -> None:
+        if self.image is None or self.image_path is None:
+            messagebox.showinfo(self._t("no_image"), self._t("load_first"))
+            return
+        path = filedialog.asksaveasfilename(
+            title=self._t("save_project_title"),
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        project_path = Path(path)
+        try:
+            save_project_file(
+                project_path,
+                self.image_path,
+                self.image,
+                self.regions,
+                self.base_region_index,
+                int(self.dpi_var.get()),
+                self.language,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror(self._t("project_save_error"), str(exc))
+            return
+        self.project_path = project_path
+        self.status_var.set(
+            self._t("project_saved", name=project_path.name)
+        )
+
+    def open_project(self) -> None:
+        path = filedialog.askopenfilename(
+            title=self._t("open_project_title"),
+            filetypes=[("JSON", "*.json"), (self._t("all_files"), "*.*")],
+        )
+        if not path:
+            return
+        project_path = Path(path)
+        try:
+            (
+                image,
+                image_path,
+                regions,
+                base_region_index,
+                dpi,
+                language,
+            ) = load_project_file(project_path)
+        except OSError as exc:
+            messagebox.showerror(self._t("project_open_error"), str(exc))
+            return
+        except (ValueError, TypeError, KeyError):
+            messagebox.showerror(
+                self._t("project_open_error"), self._t("project_invalid")
+            )
+            return
+
+        self.image = image
+        self.image_path = image_path
+        self.project_path = project_path
+        self.regions = regions
+        self.base_region_index = base_region_index
+        self.dpi_var.set(str(dpi))
+        self.language = language
+        self.language_var.set(next(name for name, code in LANGUAGES.items() if code == language))
+        self.delete_vertex_mode = False
+        self._update_delete_vertex_button()
+        self.selected_index = None
+        self.selected_vertex = None
+        self.dragging_vertex = None
+        self.hovered_vertex = None
+        self.drawing = False
+        self.lasso_points.clear()
+        self.lasso_region_index = None
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.pan_start = None
+        self.canvas.configure(cursor="arrow")
+        self._sync_region_controls()
+        self._update_statistics()
+        self.apply_language()
+        self.status_var.set(
+            self._t(
+                "project_opened",
+                name=project_path.name,
+                image=image_path.name,
+            )
+        )
+
     def start_lasso(self) -> None:
         if self.image is None:
             messagebox.showinfo(self._t("no_image"), self._t("load_first"))
@@ -365,11 +661,16 @@ class ImageAnalyzerApp:
         self._set_delete_vertex_mode(False)
         if self.drawing:
             self._finish_lasso()
+        self.region_list.selection_clear(0, tk.END)
+        self.selected_index = None
+        self._sync_region_controls()
+        self.suppress_vertex_hover = False
         self.drawing = True
         self.lasso_points.clear()
         self.lasso_region_index = None
         self.hovered_vertex = None
         self.selected_vertex = None
+        self.dragging_vertex = None
         self.canvas.configure(cursor="crosshair")
         self.status_var.set(self._t("lasso_instructions"))
         self._render()
@@ -395,6 +696,9 @@ class ImageAnalyzerApp:
     def _render(self) -> None:
         self.canvas.delete("all")
         if self.image is None:
+            if hasattr(self, "horizontal_scrollbar"):
+                self.horizontal_scrollbar.set(0, 1)
+                self.vertical_scrollbar.set(0, 1)
             self.canvas.create_text(
                 max(1, self.canvas.winfo_width()) / 2,
                 max(1, self.canvas.winfo_height()) / 2,
@@ -405,6 +709,7 @@ class ImageAnalyzerApp:
             return
 
         self._fit_image()
+        self._update_scrollbars()
         preview_source = self.image.resize(self.display_size, Image.Resampling.LANCZOS)
         scale_x = self.display_size[0] / self.image.width
         scale_y = self.display_size[1] / self.image.height
@@ -454,6 +759,58 @@ class ImageAnalyzerApp:
                     outline="#101010",
                     width=2,
                 )
+
+    def _update_scrollbars(self) -> None:
+        if not hasattr(self, "horizontal_scrollbar"):
+            return
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        display_width, display_height = self.display_size
+
+        if display_width <= canvas_width:
+            self.horizontal_scrollbar.set(0, 1)
+        else:
+            first = max(0.0, min(1.0, -self.image_x / display_width))
+            last = min(1.0, first + canvas_width / display_width)
+            self.horizontal_scrollbar.set(first, last)
+
+        if display_height <= canvas_height:
+            self.vertical_scrollbar.set(0, 1)
+        else:
+            first = max(0.0, min(1.0, -self.image_y / display_height))
+            last = min(1.0, first + canvas_height / display_height)
+            self.vertical_scrollbar.set(first, last)
+
+    def _scroll_view(self, axis: str, command: str, value: str, *extra: str) -> None:
+        if self.image is None or axis not in {"x", "y"}:
+            return
+        horizontal = axis == "x"
+        display_size = self.display_size[0 if horizontal else 1]
+        viewport_size = max(
+            1,
+            self.canvas.winfo_width() if horizontal else self.canvas.winfo_height(),
+        )
+        if display_size <= viewport_size:
+            return
+
+        if command == "moveto":
+            first = max(0.0, min(1.0, float(value)))
+            first = min(first, 1.0 - viewport_size / display_size)
+            origin = -first * display_size
+            centered_origin = (viewport_size - display_size) / 2
+            pan = origin - centered_origin
+        elif command == "scroll":
+            amount = float(value)
+            step = viewport_size * (0.9 if extra and extra[0] == "pages" else 0.1)
+            pan = (self.pan_x if horizontal else self.pan_y) - amount * step
+        else:
+            return
+
+        if horizontal:
+            self.pan_x = pan
+        else:
+            self.pan_y = pan
+        self._render()
 
     def _image_to_canvas(self, point: tuple[float, float]) -> tuple[float, float]:
         return self.image_x + point[0] * self.scale_x, self.image_y + point[1] * self.scale_y
@@ -509,7 +866,11 @@ class ImageAnalyzerApp:
 
     def _on_press(self, event: tk.Event) -> None:
         if self.delete_vertex_mode:
-            nearest = self._find_nearby_vertex(event.x, event.y)
+            nearest = (
+                self._find_nearby_vertex(event.x, event.y, self.selected_index)
+                if self.selected_index is not None
+                else None
+            )
             if nearest is None:
                 self.hovered_vertex = None
                 self.selected_vertex = None
@@ -557,21 +918,62 @@ class ImageAnalyzerApp:
                 self._render()
             return
         self.dragging_vertex = None
-        nearest = self._find_nearby_vertex(event.x, event.y)
+        nearest = (
+            self._find_nearby_vertex(event.x, event.y, self.selected_index)
+            if self.selected_index is not None
+            else None
+        )
         self.hovered_vertex = nearest
         if nearest is not None:
-            self.selected_index, self.selected_vertex = nearest
+            self.selected_vertex = nearest[1]
             self.dragging_vertex = self.selected_vertex
-            self.region_list.selection_clear(0, tk.END)
-            self.region_list.selection_set(self.selected_index)
-            self.region_list.activate(self.selected_index)
-            self._sync_opacity_control()
-            self._sync_border_width_control()
-            self._sync_region_controls()
-            self._sync_region_controls()
+        elif self.selected_index is not None:
+            point = self._canvas_to_image(event.x, event.y)
+            if point is not None and self._insert_vertex_near_edge(point):
+                return
+            self.selected_vertex = None
         else:
             self.selected_vertex = None
         self._render()
+
+    def _insert_vertex_near_edge(self, point: tuple[float, float]) -> bool:
+        if self.selected_index is None:
+            return False
+        region = self.regions[self.selected_index]
+        if len(region.points) < 3:
+            return False
+
+        closest_edge: tuple[float, int, tuple[float, float]] | None = None
+        for index, start in enumerate(region.points):
+            end = region.points[(index + 1) % len(region.points)]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length_squared = dx * dx + dy * dy
+            t = 0 if length_squared == 0 else max(
+                0,
+                min(
+                    1,
+                    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+                    / length_squared,
+                ),
+            )
+            projected = (start[0] + t * dx, start[1] + t * dy)
+            distance = math.hypot(
+                (point[0] - projected[0]) * self.scale_x,
+                (point[1] - projected[1]) * self.scale_y,
+            )
+            if closest_edge is None or distance < closest_edge[0]:
+                closest_edge = (distance, index + 1, projected)
+
+        if closest_edge is None or closest_edge[0] > VERTEX_MAGNET_RADIUS:
+            return False
+        _, insert_at, projected = closest_edge
+        region.points.insert(insert_at, projected)
+        self.selected_vertex = insert_at
+        self.hovered_vertex = (self.selected_index, insert_at)
+        self._update_statistics()
+        self._refresh_regions()
+        self._render()
+        return True
 
     def _on_drag(self, event: tk.Event) -> None:
         point = self._canvas_to_image(event.x, event.y)
@@ -601,16 +1003,14 @@ class ImageAnalyzerApp:
             self.hovered_vertex = self._find_nearby_vertex(
                 _event.x,
                 _event.y,
-                self.lasso_region_index if self.drawing else None,
+                (
+                    self.lasso_region_index
+                    if self.drawing
+                    else self.selected_index
+                ),
             )
             if self.hovered_vertex is not None:
-                self.selected_index, self.selected_vertex = self.hovered_vertex
-                self.region_list.selection_clear(0, tk.END)
-                self.region_list.selection_set(self.selected_index)
-                self.region_list.activate(self.selected_index)
-                self._sync_opacity_control()
-                self._sync_border_width_control()
-                self._sync_region_controls()
+                self.selected_vertex = self.hovered_vertex[1]
             else:
                 self.selected_vertex = None
             self._set_canvas_cursor()
@@ -637,33 +1037,30 @@ class ImageAnalyzerApp:
         point = self._canvas_to_image(event.x, event.y)
         if point is None or len(region.points) < 3:
             return
-        closest_edge: tuple[float, int, tuple[float, float]] | None = None
-        for index, start in enumerate(region.points):
-            end = region.points[(index + 1) % len(region.points)]
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            length_squared = dx * dx + dy * dy
-            t = 0 if length_squared == 0 else max(
-                0, min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
-                       / length_squared)
-            )
-            projected = (start[0] + t * dx, start[1] + t * dy)
-            distance = math.dist(point, projected) * self.scale
-            if closest_edge is None or distance < closest_edge[0]:
-                closest_edge = (distance, index + 1, projected)
-        if closest_edge is not None and closest_edge[0] <= 12:
-            _, insert_at, projected = closest_edge
-            region.points.insert(insert_at, projected)
-            self.selected_vertex = insert_at
-            self._update_statistics()
-            self._render()
+        if self._find_nearby_vertex(
+            event.x, event.y, region_index=self.selected_index
+        ) is not None:
+            return
+        if self._insert_vertex_near_edge(point):
+            return
 
     def _on_mouse_move(self, event: tk.Event) -> None:
         if self.image is None or self.dragging_vertex is not None:
             return
-        nearby = self._find_nearby_vertex(
-            event.x,
-            event.y,
-            self.lasso_region_index if self.drawing else None,
+        if getattr(self, "suppress_vertex_hover", False):
+            nearby_after_escape = self._find_nearby_vertex(event.x, event.y)
+            if nearby_after_escape is not None:
+                return
+            self.suppress_vertex_hover = False
+        active_region_index = (
+            self.lasso_region_index if self.drawing else self.selected_index
+        )
+        nearby = (
+            self._find_nearby_vertex(
+                event.x, event.y, active_region_index
+            )
+            if active_region_index is not None
+            else None
         )
         if nearby == self.hovered_vertex:
             return
@@ -801,6 +1198,11 @@ class ImageAnalyzerApp:
     def _on_region_select(self, _event: tk.Event | None = None) -> None:
         selected = self.region_list.curselection()
         self.selected_index = selected[0] if selected else None
+        if (
+            self.hovered_vertex is not None
+            and self.hovered_vertex[0] != self.selected_index
+        ):
+            self.hovered_vertex = None
         if self.hovered_vertex is not None and self.hovered_vertex[0] == self.selected_index:
             self.selected_vertex = self.hovered_vertex[1]
         else:
@@ -815,37 +1217,49 @@ class ImageAnalyzerApp:
     def _on_escape(self, _event: tk.Event | None = None) -> str:
         if self.delete_vertex_mode:
             self._set_delete_vertex_mode(False)
+        self._clear_region_selection(suppress_hover=True)
+        return "break"
+
+    def _clear_region_selection(self, *, suppress_hover: bool = False) -> None:
+        if self.drawing:
+            self._finish_lasso()
+        self.drawing = False
+        self.lasso_points = []
+        self.lasso_region_index = None
         self.region_list.selection_clear(0, tk.END)
         self.selected_index = None
         self.selected_vertex = None
         self.hovered_vertex = None
         self.dragging_vertex = None
+        self.suppress_vertex_hover = suppress_hover
         self._sync_region_controls()
         self._set_canvas_cursor()
         self._render()
-        return "break"
 
     def _on_region_click(self, event: tk.Event) -> str:
-        index = self.region_list.nearest(event.y)
-        if not (0 <= index < len(self.regions)):
+        index = self.region_list.index(f"@{event.x},{event.y}")
+        bounds = self.region_list.bbox(index) if 0 <= index < len(self.regions) else None
+        if (
+            bounds is None
+            or event.y < bounds[1]
+            or event.y >= bounds[1] + bounds[3]
+            or not (0 <= index < len(self.regions))
+        ):
+            if self.delete_vertex_mode:
+                self._set_delete_vertex_mode(False)
+            self._clear_region_selection()
             return "break"
 
         if index == self.selected_index:
             if self.delete_vertex_mode:
                 self._set_delete_vertex_mode(False)
-            self.region_list.selection_clear(0, tk.END)
-            self.selected_index = None
-            self.selected_vertex = None
-            self.hovered_vertex = None
-            self.dragging_vertex = None
-            self._sync_region_controls()
-            self._set_canvas_cursor()
-            self._render()
+            self._clear_region_selection()
             return "break"
 
         self.region_list.selection_clear(0, tk.END)
         self.region_list.selection_set(index)
         self.region_list.activate(index)
+        self.hovered_vertex = None
         self._on_region_select()
         return "break"
 
@@ -1108,10 +1522,98 @@ class ImageAnalyzerApp:
             return None
         return self.regions[self.selected_index]
 
+    def _choose_export_regions(
+        self,
+    ) -> tuple[list[int], bool, bool] | None:
+        if not self.regions:
+            return [], True, False
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self._t("export_options_title"))
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=self._t("export_regions_prompt")).pack(anchor=tk.W)
+
+        selected_vars = [tk.BooleanVar(value=True) for _ in self.regions]
+        regions_frame = ttk.Frame(frame)
+        regions_frame.pack(fill=tk.X, pady=(8, 12))
+        for index, (region, variable) in enumerate(zip(self.regions, selected_vars)):
+            ttk.Checkbutton(
+                regions_frame, text=region.name, variable=variable
+            ).grid(row=index, column=0, sticky=tk.W, pady=2)
+
+        selection_buttons = ttk.Frame(frame)
+        selection_buttons.pack(fill=tk.X, pady=(0, 10))
+
+        def set_all(value: bool) -> None:
+            for variable in selected_vars:
+                variable.set(value)
+
+        ttk.Button(
+            selection_buttons,
+            text=self._t("select_all"),
+            command=lambda: set_all(True),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            selection_buttons, text=self._t("select_none"), command=lambda: set_all(False)
+        ).pack(side=tk.LEFT)
+
+        include_intersections = tk.BooleanVar(value=True)
+        crop_to_regions = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text=self._t("include_intersections"),
+            variable=include_intersections,
+        ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            frame,
+            text=self._t("crop_export"),
+            variable=crop_to_regions,
+        ).pack(anchor=tk.W, pady=(4, 12))
+
+        result: dict[str, tuple[list[int], bool, bool] | None] = {"value": None}
+
+        def accept() -> None:
+            indices = [
+                index for index, variable in enumerate(selected_vars) if variable.get()
+            ]
+            if not indices:
+                messagebox.showinfo(
+                    self._t("export_options_title"),
+                    self._t("select_export_region"),
+                    parent=dialog,
+                )
+                return
+            result["value"] = (
+                indices,
+                include_intersections.get(),
+                crop_to_regions.get(),
+            )
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X)
+        ttk.Button(
+            buttons, text=self._t("cancel"), command=dialog.destroy
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            buttons, text=self._t("continue"), command=accept
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.wait_window()
+        return result["value"]
+
     def export_image(self) -> None:
         if self.image is None:
             messagebox.showinfo(self._t("no_image"), self._t("load_first"))
             return
+        options = self._choose_export_regions()
+        if options is None:
+            return
+        selected_indices, include_intersections, crop_to_regions = options
         path = filedialog.asksaveasfilename(
             title=self._t("image_export_title"),
             defaultextension=".png",
@@ -1120,7 +1622,13 @@ class ImageAnalyzerApp:
         if not path:
             return
         dpi = int(self.dpi_var.get())
-        result = make_annotated_image(self.image, self.regions)
+        result = make_region_export(
+            self.image,
+            self.regions,
+            selected_indices,
+            include_intersections=include_intersections,
+            crop_to_regions=crop_to_regions,
+        )
         try:
             result.save(path, dpi=(dpi, dpi))
         except (OSError, ValueError) as exc:

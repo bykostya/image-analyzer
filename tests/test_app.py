@@ -14,6 +14,9 @@ from app import (
     calculate_area_percentage,
     calculate_region_areas,
     make_annotated_image,
+    make_region_export,
+    save_project_file,
+    load_project_file,
 )
 from translations import LANGUAGES, translate
 import translations
@@ -110,6 +113,128 @@ class RegionAreaTests(unittest.TestCase):
 
         self.assertEqual(result.size, source.size)
         self.assertNotEqual(result.getpixel((4, 3)), source.getpixel((4, 3)))
+
+    def test_region_export_crops_to_selected_regions_and_preserves_source_background(self) -> None:
+        source = Image.new("RGB", (24, 24), "#dddddd")
+        region = Region(
+            "Selected",
+            [(8, 8), (16, 8), (16, 16), (8, 16)],
+            "#00ff00",
+            opacity=100,
+            border_width=2,
+        )
+
+        result = make_region_export(source, [region], [0])
+
+        self.assertEqual(result.size, (11, 11))
+        self.assertEqual(result.getpixel((5, 5)), (0, 255, 0))
+
+    def test_region_export_can_hide_overlap_fills_without_hiding_individual_regions(self) -> None:
+        source = Image.new("RGB", (24, 24), "#dddddd")
+        regions = [
+            Region(
+                "A",
+                [(2, 2), (14, 2), (14, 14), (2, 14)],
+                "#ff0000",
+                opacity=100,
+            ),
+            Region(
+                "B",
+                [(9, 9), (20, 9), (20, 20), (9, 20)],
+                "#00ff00",
+                opacity=100,
+            ),
+        ]
+
+        result = make_region_export(
+            source, regions, [0, 1], include_intersections=False, crop_to_regions=False
+        )
+
+        self.assertEqual(result.getpixel((11, 11)), (221, 221, 221))
+        self.assertEqual(result.getpixel((5, 5)), (255, 0, 0))
+        self.assertEqual(result.getpixel((18, 18)), (0, 255, 0))
+
+
+class ProjectFileTests(unittest.TestCase):
+    def test_project_round_trip_preserves_regions_and_resolves_relative_image_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "base.png"
+            project_path = root / "projects" / "analysis.json"
+            project_path.parent.mkdir()
+            image = Image.new("RGB", (32, 24), "#eeeeee")
+            image.save(image_path)
+            regions = [
+                Region(
+                    "Measured area",
+                    [(2.5, 3.0), (20.0, 3.0), (18.0, 17.5)],
+                    "#aabbcc",
+                    opacity=63,
+                    border_width=5,
+                )
+            ]
+
+            save_project_file(
+                project_path, image_path, image, regions, 0, 500, "sr"
+            )
+            loaded = load_project_file(project_path)
+
+            loaded_image, loaded_path, loaded_regions, base_index, dpi, language = loaded
+            self.assertEqual(loaded_image.size, image.size)
+            self.assertEqual(loaded_path, image_path.resolve())
+            self.assertEqual(loaded_regions, regions)
+            self.assertEqual(base_index, 0)
+            self.assertEqual(dpi, 500)
+            self.assertEqual(language, "sr")
+
+    def test_invalid_project_version_is_rejected(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_path = Path(temp_dir) / "invalid.json"
+            project_path.write_text(
+                json.dumps({"format": "image-analyzer-project", "version": 2}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unsupported project version"):
+                load_project_file(project_path)
+
+
+class AppBehaviorTests(unittest.TestCase):
+    def test_starting_new_lasso_deselects_previous_region_until_new_region_exists(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (20, 20), "white")
+        app.regions = [
+            Region("Previous", [(1, 1), (10, 1), (10, 10)], "#ff0000")
+        ]
+        app.selected_index = 0
+        app.selected_vertex = 1
+        app.hovered_vertex = (0, 1)
+        app.suppress_vertex_hover = False
+        app.dragging_vertex = None
+        app.delete_vertex_mode = False
+        app.drawing = False
+        app.pan_start = None
+        app.lasso_points = []
+        app.lasso_region_index = None
+        app.region_list = Mock()
+        app.canvas = Mock()
+        app.status_var = Mock()
+        app._sync_region_controls = Mock()
+        app._render = Mock()
+
+        app.start_lasso()
+
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.selected_vertex)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertIsNone(app.dragging_vertex)
+        self.assertTrue(app.drawing)
+        app.region_list.selection_clear.assert_called_with(0, "end")
+        app._sync_region_controls.assert_called()
 
     def test_outline_width_changes_rendered_border(self) -> None:
         source = Image.new("RGB", (30, 30), "white")
@@ -249,6 +374,39 @@ class RegionAreaTests(unittest.TestCase):
             with Image.open(output_path) as exported:
                 self.assertEqual(exported.size, (20, 12))
                 self.assertAlmostEqual(exported.info["dpi"][0], 200, delta=1)
+
+    def test_image_export_uses_selected_regions_and_crop_options(self) -> None:
+        from app import ImageAnalyzerApp
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "selected.png"
+            app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+            app.image = Image.new("RGB", (24, 24), "white")
+            app.regions = [
+                Region(
+                    "A",
+                    [(2, 2), (10, 2), (10, 10), (2, 10)],
+                    "#ff0000",
+                    opacity=100,
+                ),
+                Region(
+                    "B",
+                    [(8, 8), (16, 8), (16, 16), (8, 16)],
+                    "#00ff00",
+                    opacity=100,
+                ),
+            ]
+            app._choose_export_regions = Mock(return_value=([1], False, True))
+            app.dpi_var = Mock()
+            app.dpi_var.get.return_value = "300"
+            app.status_var = Mock()
+
+            with patch("app.filedialog.asksaveasfilename", return_value=str(output_path)):
+                app.export_image()
+
+            with Image.open(output_path) as exported:
+                self.assertEqual(exported.size, (11, 11))
+                self.assertEqual(exported.getpixel((5, 5)), (0, 255, 0))
 
     def test_excel_export_includes_selected_base_and_area_percentages(self) -> None:
         from app import ImageAnalyzerApp
@@ -428,6 +586,193 @@ class RegionAreaTests(unittest.TestCase):
 
         self.assertEqual(app.dragging_vertex, 0)
 
+    def test_hovering_or_clicking_unselected_region_does_not_activate_it(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (80, 80), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region(
+                "Selected",
+                [(5.0, 5.0), (20.0, 5.0), (20.0, 20.0)],
+                "#ff0000",
+            ),
+            Region(
+                "Unselected",
+                [(50.0, 50.0), (70.0, 50.0), (70.0, 70.0)],
+                "#00ff00",
+            ),
+        ]
+        app.drawing = False
+        app.lasso_region_index = None
+        app.delete_vertex_mode = False
+        app.dragging_vertex = None
+        app.pan_start = None
+        app.hovered_vertex = None
+        app.selected_index = 0
+        app.selected_vertex = None
+        app.region_list = Mock()
+        app.canvas = Mock()
+        app._sync_region_controls = Mock()
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._set_canvas_cursor = Mock()
+        app._render = Mock()
+
+        event = SimpleNamespace(x=50.0, y=50.0)
+        app._on_mouse_move(event)
+        app._on_press(event)
+
+        self.assertEqual(app.selected_index, 0)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertIsNone(app.selected_vertex)
+        app.region_list.selection_set.assert_not_called()
+        app.region_list.activate.assert_not_called()
+
+    def test_hover_during_new_lasso_does_not_select_existing_regions(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (40, 40), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region("First", [(10.0, 10.0), (25.0, 10.0), (25.0, 25.0)], "#ff0000"),
+            Region("Second", [(5.0, 5.0), (30.0, 5.0), (30.0, 30.0)], "#00ff00"),
+        ]
+        app.drawing = True
+        app.lasso_region_index = None
+        app.dragging_vertex = None
+        app.hovered_vertex = None
+        app.selected_index = None
+        app.selected_vertex = None
+        app.delete_vertex_mode = False
+        app.pan_start = None
+        app.region_list = Mock()
+        app.opacity_var = Mock()
+        app._sync_border_width_control = Mock()
+        app._sync_region_controls = Mock()
+        app.status_var = Mock()
+        app.canvas = Mock()
+        app._render = Mock()
+
+        app._on_mouse_move(SimpleNamespace(x=10.0, y=10.0))
+
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertIsNone(app.selected_vertex)
+        app.region_list.selection_set.assert_not_called()
+        app._render.assert_not_called()
+
+    def test_single_click_near_selected_region_edge_inserts_editable_vertex(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (80, 80), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region(
+                "Editable",
+                [(10.0, 10.0), (50.0, 10.0), (50.0, 50.0), (10.0, 50.0)],
+                "#ff0000",
+            )
+        ]
+        app.selected_index = 0
+        app.selected_vertex = None
+        app.hovered_vertex = None
+        app.dragging_vertex = None
+        app.delete_vertex_mode = False
+        app.drawing = False
+        app.region_list = Mock()
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+        app._render = Mock()
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._sync_region_controls = Mock()
+
+        app._on_press(SimpleNamespace(x=30.0, y=12.0))
+
+        self.assertEqual(len(app.regions[0].points), 5)
+        self.assertEqual(app.regions[0].points[1], (30.0, 10.0))
+        self.assertEqual(app.selected_vertex, 1)
+        app._update_statistics.assert_called_once()
+        app._refresh_regions.assert_called_once()
+        app._render.assert_called_once()
+
+    def test_click_away_from_selected_region_edge_does_not_insert_vertex(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (80, 80), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region(
+                "Editable",
+                [(10.0, 10.0), (50.0, 10.0), (50.0, 50.0), (10.0, 50.0)],
+                "#ff0000",
+            )
+        ]
+        app.selected_index = 0
+        app.selected_vertex = None
+        app.hovered_vertex = None
+        app.dragging_vertex = None
+        app.delete_vertex_mode = False
+        app.drawing = False
+        app.region_list = Mock()
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+        app._render = Mock()
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._sync_region_controls = Mock()
+
+        app._on_press(SimpleNamespace(x=30.0, y=30.0))
+
+        self.assertEqual(len(app.regions[0].points), 4)
+        app._update_statistics.assert_not_called()
+        app._refresh_regions.assert_not_called()
+
+    def test_double_click_on_new_vertex_does_not_insert_duplicate_point(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (80, 80), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region(
+                "Editable",
+                [(10.0, 10.0), (30.0, 10.0), (50.0, 10.0), (50.0, 50.0)],
+                "#ff0000",
+            )
+        ]
+        app.selected_index = 0
+        app.drawing = False
+
+        app._on_double_click(SimpleNamespace(x=30.0, y=10.0))
+
+        self.assertEqual(len(app.regions[0].points), 4)
+
     def test_zoom_keeps_image_point_under_cursor_fixed(self) -> None:
         from app import ImageAnalyzerApp
 
@@ -477,6 +822,48 @@ class RegionAreaTests(unittest.TestCase):
         app._on_mouse_wheel(SimpleNamespace(delta=-120, x=30, y=40))
 
         app._zoom_at.assert_called_once_with(30, 40, 1 / 1.15)
+
+    def test_scrollbar_moveto_updates_pan_and_renders(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (300, 240), "white")
+        app.canvas = Mock()
+        app.canvas.winfo_width.return_value = 100
+        app.canvas.winfo_height.return_value = 80
+        app.display_size = (300, 240)
+        app.pan_x = 0.0
+        app.pan_y = 0.0
+        app._render = Mock()
+
+        app._scroll_view("x", "moveto", "0.5")
+        self.assertEqual(app.pan_x, -50.0)
+        self.assertEqual(app.pan_y, 0.0)
+        app._render.assert_called_once()
+
+        app._scroll_view("y", "moveto", "0.5")
+        self.assertEqual(app.pan_y, -40.0)
+        self.assertEqual(app._render.call_count, 2)
+
+    def test_scrollbar_thumb_tracks_visible_image_area(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.canvas = Mock()
+        app.canvas.winfo_width.return_value = 100
+        app.canvas.winfo_height.return_value = 80
+        app.display_size = (300, 240)
+        app.image_x = -100.0
+        app.image_y = -80.0
+        app.horizontal_scrollbar = Mock()
+        app.vertical_scrollbar = Mock()
+
+        app._update_scrollbars()
+
+        app.horizontal_scrollbar.set.assert_called_once_with(
+            100 / 300, 200 / 300
+        )
+        app.vertical_scrollbar.set.assert_called_once_with(1 / 3, 2 / 3)
 
     def test_right_drag_updates_pan_without_resetting_zoom(self) -> None:
         from app import ImageAnalyzerApp
@@ -644,13 +1031,14 @@ class RegionAreaTests(unittest.TestCase):
         app.delete_vertex_mode = False
         app.pan_start = None
         app.region_list = Mock()
-        app.region_list.nearest.return_value = 0
+        app.region_list.index.return_value = 0
+        app.region_list.bbox.return_value = (0, 0, 100, 20)
         app.canvas = Mock()
         app.drawing = False
         app._sync_region_controls = Mock()
         app._render = Mock()
 
-        result = app._on_region_click(SimpleNamespace(y=10))
+        result = app._on_region_click(SimpleNamespace(x=10, y=10))
 
         self.assertEqual(result, "break")
         self.assertIsNone(app.selected_index)
@@ -673,14 +1061,15 @@ class RegionAreaTests(unittest.TestCase):
         app.hovered_vertex = None
         app.dragging_vertex = None
         app.region_list = Mock()
-        app.region_list.nearest.return_value = 1
+        app.region_list.index.return_value = 1
+        app.region_list.bbox.return_value = (0, 20, 100, 20)
         app.region_list.curselection.return_value = (1,)
         app._sync_opacity_control = Mock()
         app._sync_border_width_control = Mock()
         app._sync_region_controls = Mock()
         app._render = Mock()
 
-        result = app._on_region_click(SimpleNamespace(y=30))
+        result = app._on_region_click(SimpleNamespace(x=10, y=30))
 
         self.assertEqual(result, "break")
         self.assertEqual(app.selected_index, 1)
@@ -745,6 +1134,192 @@ class RegionAreaTests(unittest.TestCase):
         app.region_list.selection_clear.assert_called_once_with(0, "end")
         app._sync_region_controls.assert_called_once()
         app._render.assert_called_once()
+
+    def test_escape_does_not_reselect_region_when_pointer_moves_over_vertex(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (40, 40), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.regions = [
+            Region("First", [(10.0, 10.0), (25.0, 10.0), (25.0, 25.0)], "#ff0000"),
+            Region("Second", [(5.0, 5.0), (30.0, 5.0), (30.0, 30.0)], "#00ff00"),
+        ]
+        app.delete_vertex_mode = False
+        app.selected_index = 0
+        app.selected_vertex = 0
+        app.hovered_vertex = (0, 0)
+        app.dragging_vertex = None
+        app.drawing = False
+        app.pan_start = None
+        app.region_list = Mock()
+        app.canvas = Mock()
+        app.status_var = Mock()
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._sync_region_controls = Mock()
+        app._set_canvas_cursor = Mock()
+        app._render = Mock()
+
+        app._on_escape()
+        app._on_mouse_move(SimpleNamespace(x=10.0, y=10.0))
+
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertTrue(app.suppress_vertex_hover)
+
+        app._on_mouse_move(SimpleNamespace(x=39.0, y=39.0))
+        self.assertFalse(app.suppress_vertex_hover)
+        app._on_mouse_move(SimpleNamespace(x=10.0, y=10.0))
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.hovered_vertex)
+
+    def test_clicking_second_region_uses_clicked_list_row_not_stale_vertex_hover(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.regions = [
+            Region("First", [(1, 1), (8, 1), (8, 8)], "#ff0000"),
+            Region("Second", [(2, 2), (9, 2), (9, 9)], "#00ff00"),
+            Region("Third", [(3, 3), (10, 3), (10, 10)], "#0000ff"),
+        ]
+        app.selected_index = 0
+        app.selected_vertex = 0
+        app.hovered_vertex = (0, 0)
+        app.dragging_vertex = None
+        app.delete_vertex_mode = False
+        app.pan_start = None
+        app.region_list = Mock()
+        app.region_list.index.return_value = 1
+        app.region_list.bbox.return_value = (0, 20, 100, 20)
+        app.region_list.curselection.return_value = (1,)
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._sync_region_controls = Mock()
+        app._render = Mock()
+
+        app._on_region_click(SimpleNamespace(x=10, y=30))
+
+        self.assertEqual(app.selected_index, 1)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertIsNone(app.selected_vertex)
+        app.region_list.index.assert_called_once_with("@10,30")
+
+    def test_clicking_empty_space_below_regions_clears_selection(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.regions = [
+            Region("First", [(1, 1), (8, 1), (8, 8)], "#ff0000"),
+            Region("Second", [(2, 2), (9, 2), (9, 9)], "#00ff00"),
+        ]
+        app.selected_index = 1
+        app.selected_vertex = 2
+        app.hovered_vertex = (1, 2)
+        app.dragging_vertex = None
+        app.delete_vertex_mode = False
+        app.drawing = False
+        app.pan_start = None
+        app.region_list = Mock()
+        app.region_list.index.return_value = 1
+        app.region_list.bbox.return_value = (0, 20, 100, 20)
+        app._sync_region_controls = Mock()
+        app._set_canvas_cursor = Mock()
+        app._render = Mock()
+
+        result = app._on_region_click(SimpleNamespace(x=10, y=75))
+
+        self.assertEqual(result, "break")
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.selected_vertex)
+        self.assertIsNone(app.hovered_vertex)
+        app.region_list.selection_clear.assert_called_once_with(0, "end")
+        app.region_list.selection_set.assert_not_called()
+        app._sync_region_controls.assert_called_once()
+        app._render.assert_called_once()
+
+    def test_escape_finishes_active_lasso_and_hides_its_points(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.delete_vertex_mode = False
+        app.drawing = True
+        app.lasso_points = [(2.0, 2.0), (8.0, 2.0)]
+        app.lasso_region_index = None
+        app.regions = []
+        app.selected_index = None
+        app.selected_vertex = None
+        app.hovered_vertex = None
+        app.dragging_vertex = None
+        app.region_list = Mock()
+        app.status_var = Mock()
+        app._sync_region_controls = Mock()
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+        app._set_canvas_cursor = Mock()
+        app._render = Mock()
+
+        result = app._on_escape()
+
+        self.assertEqual(result, "break")
+        self.assertFalse(app.drawing)
+        self.assertEqual(app.lasso_points, [])
+        self.assertIsNone(app.lasso_region_index)
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.selected_vertex)
+        app._render.assert_called()
+
+    def test_escape_clears_active_lasso_preview_without_restoring_yellow_points(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        region = Region(
+            "Fourth",
+            [(2.0, 2.0), (18.0, 2.0), (18.0, 18.0), (2.0, 18.0)],
+            "#ff0000",
+        )
+        app.delete_vertex_mode = False
+        app.drawing = True
+        app.lasso_points = region.points
+        app.lasso_region_index = 0
+        app.regions = [region]
+        app.selected_index = 0
+        app.selected_vertex = None
+        app.hovered_vertex = None
+        app.dragging_vertex = None
+        app.region_list = Mock()
+        app.status_var = Mock()
+        app._sync_region_controls = Mock()
+        app._sync_opacity_control = Mock()
+        app._sync_border_width_control = Mock()
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+        app._set_canvas_cursor = Mock()
+        app._render = Mock()
+        app.canvas = Mock()
+        app.image = Image.new("RGB", (24, 24), "white")
+        app.image_x = 0.0
+        app.image_y = 0.0
+        app.scale = 1.0
+        app.scale_x = 1.0
+        app.scale_y = 1.0
+        app.suppress_vertex_hover = False
+
+        app._on_escape()
+        app._on_release(SimpleNamespace(x=2.0, y=2.0))
+        app._on_mouse_move(SimpleNamespace(x=2.0, y=2.0))
+
+        self.assertFalse(app.drawing)
+        self.assertEqual(app.lasso_points, [])
+        self.assertIsNone(app.lasso_region_index)
+        self.assertIsNone(app.selected_index)
+        self.assertIsNone(app.selected_vertex)
+        self.assertIsNone(app.hovered_vertex)
+        self.assertTrue(app.suppress_vertex_hover)
 
 
 
