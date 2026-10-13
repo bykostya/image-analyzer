@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, ImageTk
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
@@ -40,6 +40,10 @@ class Region:
     color: str
     opacity: int = 40
     border_width: int = 2
+    visible: bool = True
+    percentage_base_index: int | None = None
+    percentage_color: str | None = None
+    percentage_label_position: tuple[float, float] | None = None
 
 
 def calculate_region_areas(
@@ -66,6 +70,122 @@ def calculate_area_percentage(area: int, base_area: int) -> float | None:
     return area / base_area * 100
 
 
+def _percentage_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except OSError:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+
+
+def _default_percentage_label_position(
+    image_size: tuple[int, int], region: Region, font: ImageFont.ImageFont, text: str
+) -> tuple[float, float]:
+    mask = Image.new("L", image_size, 0)
+    if len(region.points) >= 3:
+        ImageDraw.Draw(mask).polygon(region.points, fill=255)
+    bounds = mask.getbbox()
+    if bounds is None:
+        return 0.0, 0.0
+    left, top, right, bottom = bounds
+    text_bounds = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
+        (0, 0), text, font=font
+    )
+    text_width = text_bounds[2] - text_bounds[0]
+    text_height = text_bounds[3] - text_bounds[1]
+    padding = 3
+    max_x = max(left, right - text_width - padding)
+    max_y = max(top, bottom - text_height - padding)
+    return float(min(left + padding, max_x)), float(min(top + padding, max_y))
+
+
+def _percentage_labels(
+    image_size: tuple[int, int], regions: list[Region]
+) -> list[str | None]:
+    areas, _ = calculate_region_areas(image_size, regions)
+    labels: list[str | None] = []
+    for region, area in zip(regions, areas):
+        base_index = region.percentage_base_index
+        base_area = (
+            image_size[0] * image_size[1]
+            if base_index is None
+            else areas[base_index]
+        )
+        percentage = calculate_area_percentage(area, base_area)
+        labels.append("—" if percentage is None else f"{percentage:.2f}%")
+    return labels
+
+
+def _draw_percentage_labels(
+    image: Image.Image,
+    regions: list[Region],
+    selected_indices: list[int],
+    labels: list[str | None],
+    font_size: int,
+    label_positions: dict[int, tuple[float, float]] | None = None,
+    text_colors: dict[int, str] | None = None,
+) -> list[tuple[int, tuple[float, float], tuple[int, int, int, int], str]]:
+    draw = ImageDraw.Draw(image)
+    font = _percentage_font(font_size)
+    layout = []
+    for index in selected_indices:
+        if not regions[index].visible or labels[index] is None:
+            continue
+        region = regions[index]
+        text = labels[index]
+        position = (
+            (label_positions or {}).get(index)
+            or region.percentage_label_position
+            or _default_percentage_label_position(image.size, region, font, text)
+        )
+        bounds = draw.textbbox(position, text, font=font)
+        color = (text_colors or {}).get(index) or region.percentage_color or region.color
+        red, green, blue = (
+            int(color[offset : offset + 2], 16) for offset in (1, 3, 5)
+        )
+        stroke = "#000000" if red + green + blue > 380 else "#ffffff"
+        draw.text(
+            position,
+            text,
+            font=font,
+            fill=color,
+            stroke_width=max(1, font_size // 12),
+            stroke_fill=stroke,
+        )
+        layout.append((index, position, bounds, text))
+    return layout
+
+
+def _region_export_crop_bounds(
+    image_size: tuple[int, int],
+    regions: list[Region],
+    selected_indices: list[int],
+    crop_to_regions: bool,
+) -> tuple[int, int, int, int] | None:
+    width, height = image_size
+    coverage = Image.new("L", image_size, 0)
+    selected_regions = [
+        regions[index] for index in selected_indices if regions[index].visible
+    ]
+    for region in selected_regions:
+        mask = Image.new("L", image_size, 0)
+        if len(region.points) >= 3:
+            ImageDraw.Draw(mask).polygon(region.points, fill=1)
+        coverage = ImageChops.add(coverage, mask)
+    if not crop_to_regions:
+        return (0, 0, width, height)
+    bounds = coverage.point(lambda value: 255 if value else 0).getbbox()
+    if bounds is None:
+        return None
+    margin = max((region.border_width + 1) // 2 for region in selected_regions)
+    left, top, right, bottom = bounds
+    return (
+        max(0, left - margin),
+        max(0, top - margin),
+        min(width, right + margin),
+        min(height, bottom + margin),
+    )
+
+
 def make_annotated_image(image: Image.Image, regions: list[Region]) -> Image.Image:
     """Composite translucent region fills and opaque outlines over the source."""
     base = image.convert("RGBA")
@@ -73,7 +193,7 @@ def make_annotated_image(image: Image.Image, regions: list[Region]) -> Image.Ima
     draw = ImageDraw.Draw(overlay, "RGBA")
 
     for region in regions:
-        if len(region.points) < 3:
+        if not region.visible or len(region.points) < 3:
             continue
         red, green, blue = tuple(
             int(region.color[index : index + 2], 16) for index in (1, 3, 5)
@@ -95,9 +215,16 @@ def make_region_export(
     selected_indices: list[int],
     include_intersections: bool = True,
     crop_to_regions: bool = True,
+    show_percentages: bool = False,
+    percentage_font_size: int = 24,
+    percentage_labels: list[str | None] | None = None,
+    label_positions: dict[int, tuple[float, float]] | None = None,
+    text_colors: dict[int, str] | None = None,
 ) -> Image.Image:
     """Render selected regions on the source image, optionally cropping the result."""
-    selected_regions = [regions[index] for index in selected_indices]
+    selected_regions = [
+        regions[index] for index in selected_indices if regions[index].visible
+    ]
     result = make_annotated_image(image, selected_regions)
     coverage = Image.new("L", image.size, 0)
     for region in selected_regions:
@@ -109,6 +236,21 @@ def make_region_export(
     if not include_intersections:
         overlap_mask = coverage.point(lambda value: 255 if value > 1 else 0)
         result.paste(image.convert("RGB"), mask=overlap_mask)
+
+    if show_percentages:
+        _draw_percentage_labels(
+            result,
+            regions,
+            selected_indices,
+            (
+                percentage_labels
+                if percentage_labels is not None
+                else _percentage_labels(image.size, regions)
+            ),
+            percentage_font_size,
+            label_positions,
+            text_colors,
+        )
 
     if crop_to_regions:
         bounds = coverage.point(lambda value: 255 if value else 0).getbbox()
@@ -153,6 +295,14 @@ def save_project_file(
                 "color": region.color,
                 "opacity": region.opacity,
                 "border_width": region.border_width,
+                "visible": region.visible,
+                "percentage_base_index": region.percentage_base_index,
+                "percentage_color": region.percentage_color,
+                "percentage_label_position": (
+                    list(region.percentage_label_position)
+                    if region.percentage_label_position is not None
+                    else None
+                ),
             }
             for region in regions
         ],
@@ -202,7 +352,8 @@ def load_project_file(
     region_data = project.get("regions")
     if not isinstance(region_data, list):
         raise ValueError("Project regions must be a list.")
-    regions = []
+    legacy_base_region_index = project.get("base_region_index")
+    regions: list[Region] = []
     for item in region_data:
         if not isinstance(item, dict):
             raise ValueError("Project contains an invalid region.")
@@ -211,6 +362,12 @@ def load_project_file(
         points = item.get("points")
         opacity = item.get("opacity")
         border_width = item.get("border_width")
+        visible = item.get("visible", True)
+        percentage_base_index = item.get(
+            "percentage_base_index", legacy_base_region_index
+        )
+        percentage_color = item.get("percentage_color")
+        percentage_label_position = item.get("percentage_label_position")
         if (
             not isinstance(name, str)
             or not name.strip()
@@ -223,6 +380,38 @@ def load_project_file(
             or not isinstance(border_width, int)
             or isinstance(border_width, bool)
             or not 1 <= border_width <= 12
+            or not isinstance(visible, bool)
+            or (
+                percentage_base_index is not None
+                and (
+                    not isinstance(percentage_base_index, int)
+                    or isinstance(percentage_base_index, bool)
+                    or not 0 <= percentage_base_index < len(region_data)
+                )
+            )
+            or (
+                percentage_color is not None
+                and (
+                    not isinstance(percentage_color, str)
+                    or re.fullmatch(r"#[0-9a-fA-F]{6}", percentage_color) is None
+                )
+            )
+            or (
+                percentage_label_position is not None
+                and (
+                    not isinstance(percentage_label_position, list)
+                    or len(percentage_label_position) != 2
+                    or any(
+                        not isinstance(coordinate, (int, float))
+                        or isinstance(coordinate, bool)
+                        or not math.isfinite(coordinate)
+                        or not 0 <= coordinate < dimension
+                        for coordinate, dimension in zip(
+                            percentage_label_position, (image.width, image.height)
+                        )
+                    )
+                )
+            )
         ):
             raise ValueError("Project contains invalid region settings.")
         parsed_points: list[tuple[float, float]] = []
@@ -248,7 +437,21 @@ def load_project_file(
         if len(parsed_points) < 3:
             raise ValueError("Project regions must contain at least three points.")
         regions.append(
-            Region(name, parsed_points, color.lower(), opacity, border_width)
+            Region(
+                name,
+                parsed_points,
+                color.lower(),
+                opacity,
+                border_width,
+                visible,
+                percentage_base_index,
+                percentage_color.lower() if percentage_color else None,
+                (
+                    tuple(float(value) for value in percentage_label_position)
+                    if percentage_label_position is not None
+                    else None
+                ),
+            )
         )
 
     base_region_index = project.get("base_region_index")
@@ -275,6 +478,7 @@ class ImageAnalyzerApp:
         self.root.title(self._t("title"))
         self.root.geometry("1280x820")
         self.root.minsize(850, 560)
+        self.root.state("zoomed")
 
         self.image: Image.Image | None = None
         self.image_path: Path | None = None
@@ -305,6 +509,9 @@ class ImageAnalyzerApp:
         self.base_region_index: int | None = None
         self.base_area_var = tk.StringVar(value=self._t("whole_image"))
         self.base_area_options: dict[str, int | None] = {}
+        self.region_base_vars: list[tk.StringVar] = []
+        self.region_base_options: list[dict[str, int | None]] = []
+        self.region_row_labels: list[tk.Label] = []
         self.language_var = tk.StringVar(value="Русский")
         self.opacity_var = tk.IntVar(value=60)
         self.border_width_var = tk.IntVar(value=2)
@@ -381,19 +588,38 @@ class ImageAnalyzerApp:
         self._label(side, "regions", font=("", 11, "bold")).pack(
             anchor=tk.W, pady=(0, 5)
         )
-        self._label(side, "base_area_prompt").pack(anchor=tk.W)
-        self.base_area_combo = ttk.Combobox(
-            side,
-            textvariable=self.base_area_var,
-            state="readonly",
+        self._label(side, "region_bases_hint").pack(anchor=tk.W, pady=(0, 4))
+        region_list_container = ttk.Frame(side)
+        region_list_container.pack(fill=tk.BOTH, expand=True)
+        self.region_list_canvas = tk.Canvas(
+            region_list_container, highlightthickness=0, height=210
         )
-        self.base_area_combo.pack(fill=tk.X, pady=(3, 6))
-        self.base_area_combo.bind("<<ComboboxSelected>>", self._on_base_area_change)
-        self.region_list = tk.Listbox(side, height=13, exportselection=False)
-        self.region_list.pack(fill=tk.BOTH, expand=True)
-        self.region_list.bind("<Button-1>", self._on_region_click)
-        self.region_list.bind("<<ListboxSelect>>", self._on_region_select)
+        region_scrollbar = ttk.Scrollbar(
+            region_list_container,
+            orient=tk.VERTICAL,
+            command=self.region_list_canvas.yview,
+        )
+        self.region_list_canvas.configure(yscrollcommand=region_scrollbar.set)
+        region_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.region_list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.region_list = ttk.Frame(self.region_list_canvas)
+        self.region_list_window = self.region_list_canvas.create_window(
+            (0, 0), window=self.region_list, anchor=tk.NW
+        )
+        self.region_list.bind(
+            "<Configure>",
+            lambda _event: self.region_list_canvas.configure(
+                scrollregion=self.region_list_canvas.bbox("all")
+            ),
+        )
+        self.region_list_canvas.bind(
+            "<Configure>",
+            lambda event: self.region_list_canvas.itemconfigure(
+                self.region_list_window, width=event.width
+            ),
+        )
         self.region_list.bind("<Escape>", self._on_escape)
+        self.region_list_canvas.bind("<Escape>", self._on_escape)
 
         region_buttons = ttk.Frame(side)
         region_buttons.pack(fill=tk.X, pady=(6, 10))
@@ -583,7 +809,7 @@ class ImageAnalyzerApp:
                 self.image_path,
                 self.image,
                 self.regions,
-                self.base_region_index,
+                None,
                 int(self.dpi_var.get()),
                 self.language,
             )
@@ -661,7 +887,7 @@ class ImageAnalyzerApp:
         self._set_delete_vertex_mode(False)
         if self.drawing:
             self._finish_lasso()
-        self.region_list.selection_clear(0, tk.END)
+        self._sync_region_list_selection()
         self.selected_index = None
         self._sync_region_controls()
         self.suppress_vertex_hover = False
@@ -720,6 +946,7 @@ class ImageAnalyzerApp:
                 region.color,
                 region.opacity,
                 max(1, round(region.border_width * (scale_x + scale_y) / 2)),
+                region.visible,
             )
             for region in self.regions
         ]
@@ -727,7 +954,14 @@ class ImageAnalyzerApp:
         self.tk_image = ImageTk.PhotoImage(preview)
         self.canvas.create_image(self.image_x, self.image_y, image=self.tk_image, anchor=tk.NW)
 
-        if self.drawing and self.lasso_points:
+        if (
+            self.drawing
+            and self.lasso_points
+            and (
+                self.lasso_region_index is None
+                or self.regions[self.lasso_region_index].visible
+            )
+        ):
             display_points = [self._image_to_canvas(point) for point in self.lasso_points]
             if len(display_points) > 1:
                 if len(display_points) >= 3:
@@ -743,7 +977,11 @@ class ImageAnalyzerApp:
                     x - 4, y - 4, x + 4, y + 4, fill="#ffe600", outline="#101010", width=1
                 )
 
-        if self.selected_index is not None and self.selected_index < len(self.regions):
+        if (
+            self.selected_index is not None
+            and self.selected_index < len(self.regions)
+            and self.regions[self.selected_index].visible
+        ):
             region = self.regions[self.selected_index]
             for index, point in enumerate(region.points):
                 x, y = self._image_to_canvas(point)
@@ -869,6 +1107,7 @@ class ImageAnalyzerApp:
             nearest = (
                 self._find_nearby_vertex(event.x, event.y, self.selected_index)
                 if self.selected_index is not None
+                and self.regions[self.selected_index].visible
                 else None
             )
             if nearest is None:
@@ -881,9 +1120,7 @@ class ImageAnalyzerApp:
                 return
             self.hovered_vertex = nearest
             self.selected_index, self.selected_vertex = nearest
-            self.region_list.selection_clear(0, tk.END)
-            self.region_list.selection_set(self.selected_index)
-            self.region_list.activate(self.selected_index)
+            self._sync_region_list_selection()
             point_count = len(self.regions[self.selected_index].points)
             self.delete_selected_vertex()
             if self.delete_vertex_mode and len(
@@ -897,6 +1134,7 @@ class ImageAnalyzerApp:
             nearest = (
                 self._find_nearby_vertex(event.x, event.y, self.lasso_region_index)
                 if self.lasso_region_index is not None
+                and self.regions[self.lasso_region_index].visible
                 else None
             )
             if nearest is not None:
@@ -921,6 +1159,7 @@ class ImageAnalyzerApp:
         nearest = (
             self._find_nearby_vertex(event.x, event.y, self.selected_index)
             if self.selected_index is not None
+            and self.regions[self.selected_index].visible
             else None
         )
         self.hovered_vertex = nearest
@@ -1000,14 +1239,19 @@ class ImageAnalyzerApp:
             self.dragging_vertex = None
             self._update_statistics()
             self._refresh_regions()
-            self.hovered_vertex = self._find_nearby_vertex(
-                _event.x,
-                _event.y,
-                (
-                    self.lasso_region_index
-                    if self.drawing
-                    else self.selected_index
-                ),
+            hover_region_index = (
+                self.lasso_region_index if self.drawing else self.selected_index
+            )
+            can_hover = self.drawing or (
+                self.selected_index is not None
+                and self.regions[self.selected_index].visible
+            )
+            self.hovered_vertex = (
+                self._find_nearby_vertex(
+                    _event.x, _event.y, hover_region_index
+                )
+                if can_hover
+                else None
             )
             if self.hovered_vertex is not None:
                 self.selected_vertex = self.hovered_vertex[1]
@@ -1034,6 +1278,8 @@ class ImageAnalyzerApp:
         if self.selected_index is None:
             return
         region = self.regions[self.selected_index]
+        if not region.visible:
+            return
         point = self._canvas_to_image(event.x, event.y)
         if point is None or len(region.points) < 3:
             return
@@ -1053,7 +1299,14 @@ class ImageAnalyzerApp:
                 return
             self.suppress_vertex_hover = False
         active_region_index = (
-            self.lasso_region_index if self.drawing else self.selected_index
+            self.lasso_region_index
+            if self.drawing
+            else (
+                self.selected_index
+                if self.selected_index is not None
+                and self.regions[self.selected_index].visible
+                else None
+            )
         )
         nearby = (
             self._find_nearby_vertex(
@@ -1067,9 +1320,7 @@ class ImageAnalyzerApp:
         self.hovered_vertex = nearby
         if nearby is not None:
             self.selected_index, self.selected_vertex = nearby
-            self.region_list.selection_clear(0, tk.END)
-            self.region_list.selection_set(self.selected_index)
-            self.region_list.activate(self.selected_index)
+            self._sync_region_list_selection()
             self._sync_opacity_control()
             self._sync_border_width_control()
             if self.delete_vertex_mode:
@@ -1169,7 +1420,7 @@ class ImageAnalyzerApp:
             self._sync_opacity_control()
             self._sync_border_width_control()
             self._sync_region_controls()
-            self.region_list.selection_clear(0, tk.END)
+            self._sync_region_list_selection()
             self._update_statistics()
             self._refresh_regions()
         elif self.lasso_region_index is not None:
@@ -1214,6 +1465,43 @@ class ImageAnalyzerApp:
         self._sync_region_controls()
         self._render()
 
+    def _select_region_row(self, index: int) -> None:
+        if not 0 <= index < len(self.regions):
+            return
+        if self.selected_index == index:
+            if getattr(self, "delete_vertex_mode", False):
+                self._set_delete_vertex_mode(False)
+            self._clear_region_selection()
+            return
+        if getattr(self, "delete_vertex_mode", False):
+            self._set_delete_vertex_mode(False)
+        self.selected_index = index
+        self.selected_vertex = None
+        self.hovered_vertex = None
+        self.dragging_vertex = None
+        self._sync_region_list_selection()
+        self._sync_opacity_control()
+        self._sync_border_width_control()
+        self._sync_region_controls()
+        self._render()
+
+    def _sync_region_list_selection(self) -> None:
+        if hasattr(self.region_list, "curselection"):
+            self.region_list.selection_clear(0, tk.END)
+            if self.selected_index is not None:
+                self.region_list.selection_set(self.selected_index)
+                self.region_list.activate(self.selected_index)
+        for index, label in enumerate(getattr(self, "region_row_labels", [])):
+            label.configure(
+                background="#dcecff"
+                if index == self.selected_index
+                else self.root.cget("background")
+            )
+
+    def _delete_selected_region_from_list(self, event: tk.Event) -> str:
+        self.delete_selected_region()
+        return "break"
+
     def _on_escape(self, _event: tk.Event | None = None) -> str:
         if self.delete_vertex_mode:
             self._set_delete_vertex_mode(False)
@@ -1226,8 +1514,8 @@ class ImageAnalyzerApp:
         self.drawing = False
         self.lasso_points = []
         self.lasso_region_index = None
-        self.region_list.selection_clear(0, tk.END)
         self.selected_index = None
+        self._sync_region_list_selection()
         self.selected_vertex = None
         self.hovered_vertex = None
         self.dragging_vertex = None
@@ -1250,49 +1538,117 @@ class ImageAnalyzerApp:
             self._clear_region_selection()
             return "break"
 
+        if event.x <= 30:
+            self._toggle_region_visibility(index)
+            return "break"
+
         if index == self.selected_index:
             if self.delete_vertex_mode:
                 self._set_delete_vertex_mode(False)
             self._clear_region_selection()
             return "break"
 
-        self.region_list.selection_clear(0, tk.END)
-        self.region_list.selection_set(index)
-        self.region_list.activate(index)
-        self.hovered_vertex = None
-        self._on_region_select()
+        self._select_region_row(index)
         return "break"
 
+    def _toggle_region_visibility(self, index: int) -> None:
+        if not 0 <= index < len(self.regions):
+            return
+        region = self.regions[index]
+        region.visible = not region.visible
+        self._refresh_regions()
+        self._render()
+        self.status_var.set(
+            self._t(
+                "region_visibility_shown" if region.visible else "region_visibility_hidden",
+                name=region.name,
+            )
+        )
+
     def _refresh_regions(self) -> None:
-        self.region_list.delete(0, tk.END)
+        for child in self.region_list.winfo_children():
+            child.destroy()
+        self.region_row_labels = []
+        self.region_base_vars = []
+        self.region_base_options = []
         self.base_area_options = {self._t("whole_image"): None}
         for index, region in enumerate(self.regions):
-            label = self._t(
-                "base_region_option", number=index + 1, name=region.name
-            )
-            self.base_area_options[label] = index
-        self.base_area_combo.configure(values=tuple(self.base_area_options))
-        if self.base_region_index is not None and self.base_region_index >= len(self.regions):
-            self.base_region_index = None
-        selected_base = next(
-            (
-                label
-                for label, index in self.base_area_options.items()
-                if index == self.base_region_index
-            ),
-            self._t("whole_image"),
-        )
-        self.base_area_var.set(selected_base)
-        base_area = self._base_area_pixels()
+            self.base_area_options[
+                self._t(
+                    "base_region_option", number=index + 1, name=region.name
+                )
+            ] = index
         for index, region in enumerate(self.regions):
             area = self.region_areas[index] if index < len(self.region_areas) else 0
-            percent = calculate_area_percentage(area, base_area)
+            percentage_base = self._region_base_area_pixels(region)
+            percent = calculate_area_percentage(area, percentage_base)
             percent_text = "—" if percent is None else f"{percent:.2f}%"
-            self.region_list.insert(tk.END, f"{region.name} — {percent_text}")
-            self.region_list.itemconfigure(index, foreground=region.color)
-        if self.selected_index is not None and self.selected_index < len(self.regions):
-            self.region_list.selection_set(self.selected_index)
-            self.region_list.activate(self.selected_index)
+
+            row = ttk.Frame(self.region_list)
+            row.pack(fill=tk.X, pady=1)
+            eye_icon = "👁" if region.visible else "👁̸"
+            ttk.Button(
+                row,
+                text=eye_icon,
+                width=3,
+                command=lambda region_index=index: self._toggle_region_visibility(
+                    region_index
+                ),
+            ).pack(side=tk.LEFT, padx=(0, 3))
+            row_label = tk.Label(
+                row,
+                text=f"{region.name} — {percent_text}",
+                anchor=tk.W,
+                foreground=region.color if region.visible else "#888888",
+                cursor="hand2",
+            )
+            row_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            row_label.bind(
+                "<Button-1>",
+                lambda _event, region_index=index: self._select_region_row(
+                    region_index
+                ),
+            )
+            row_label.bind(
+                "<Delete>",
+                lambda event: self._delete_selected_region_from_list(event),
+            )
+            self.region_row_labels.append(row_label)
+
+            choices = {self._t("whole_image"): None}
+            for base_index, base_region in enumerate(self.regions):
+                choices[
+                    self._t(
+                        "base_region_option",
+                        number=base_index + 1,
+                        name=base_region.name,
+                    )
+                ] = base_index
+            self.region_base_options.append(choices)
+            base_var = tk.StringVar(value=self._region_base_area_label(region))
+            self.region_base_vars.append(base_var)
+            base_row = ttk.Frame(row)
+            base_row.pack(side=tk.RIGHT, padx=(4, 0))
+            ttk.Label(base_row, text=self._t("region_base_area_prompt")).pack(
+                side=tk.LEFT, padx=(0, 3)
+            )
+            base_combo = ttk.Combobox(
+                base_row,
+                textvariable=base_var,
+                values=tuple(choices),
+                state="readonly",
+                width=15,
+            )
+            base_combo.pack(side=tk.LEFT)
+            base_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, region_index=index: self._on_region_base_change(
+                    region_index
+                ),
+            )
+            row_label.bind("<Escape>", self._on_escape)
+
+        self._sync_region_list_selection()
 
     def _update_statistics(self) -> None:
         if self.image is None:
@@ -1327,8 +1683,11 @@ class ImageAnalyzerApp:
                 self._t(
                     "region_stat",
                     name=region.name,
-                    percentage=self._format_percentage(area, base_area),
+                    percentage=self._format_percentage(
+                        area, self._region_base_area_pixels(region)
+                    ),
                     area=area,
+                    base=self._region_base_area_label(region),
                 )
                 for region, area in zip(self.regions, self.region_areas)
             )
@@ -1342,21 +1701,49 @@ class ImageAnalyzerApp:
     def _base_area_pixels(self) -> int:
         if self.image is None:
             return 0
-        if self.base_region_index is None:
-            return self.image.width * self.image.height
-        if self.base_region_index >= len(self.region_areas):
-            return 0
-        return self.region_areas[self.base_region_index]
+        return self.image.width * self.image.height
 
     def _base_area_label(self) -> str:
-        if self.base_region_index is None:
-            return self._t("whole_image")
-        if self.base_region_index >= len(self.regions):
-            return self._t("whole_image")
-        return self.regions[self.base_region_index].name
+        return self._t("whole_image")
+
+    def _region_base_area_pixels(self, region: Region) -> int:
+        if self.image is None:
+            return 0
+        index = region.percentage_base_index
+        if index is None:
+            return self.image.width * self.image.height
+        if not 0 <= index < len(self.region_areas):
+            return 0
+        return self.region_areas[index]
+
+    def _region_base_area_label(self, region: Region) -> str:
+        choices = {self._t("whole_image"): None}
+        for index, base_region in enumerate(self.regions):
+            choices[
+                self._t("base_region_option", number=index + 1, name=base_region.name)
+            ] = index
+        return next(
+            (
+                label
+                for label, index in choices.items()
+                if index == region.percentage_base_index
+            ),
+            self._t("whole_image"),
+        )
 
     def _on_base_area_change(self, _event: tk.Event | None = None) -> None:
         self.base_region_index = self.base_area_options.get(self.base_area_var.get())
+        self._update_statistics()
+        self._refresh_regions()
+
+    def _on_region_base_change(self, region_index: int) -> None:
+        if not 0 <= region_index < len(self.regions):
+            return
+        self.regions[region_index].percentage_base_index = (
+            self.region_base_options[region_index].get(
+                self.region_base_vars[region_index].get()
+            )
+        )
         self._update_statistics()
         self._refresh_regions()
 
@@ -1460,6 +1847,14 @@ class ImageAnalyzerApp:
             self._finish_lasso()
         removed_index = self.selected_index
         del self.regions[removed_index]
+        for region in self.regions:
+            if region.percentage_base_index == removed_index:
+                region.percentage_base_index = None
+            elif (
+                region.percentage_base_index is not None
+                and region.percentage_base_index > removed_index
+            ):
+                region.percentage_base_index -= 1
         if self.base_region_index == removed_index:
             self.base_region_index = None
         elif self.base_region_index is not None and self.base_region_index > removed_index:
@@ -1479,7 +1874,9 @@ class ImageAnalyzerApp:
         self.status_var.set(self._t("region_deleted"))
 
     def _delete_selected_region(self, event: tk.Event) -> None:
-        if event.widget is self.region_list:
+        if event.widget is self.region_list or event.widget in getattr(
+            self, "region_row_labels", []
+        ):
             self.delete_selected_region()
 
     def delete_selected_vertex(self) -> None:
@@ -1522,35 +1919,326 @@ class ImageAnalyzerApp:
             return None
         return self.regions[self.selected_index]
 
+    def _make_export_preview(
+        self,
+        selected_indices: list[int],
+        include_intersections: bool,
+        crop_to_regions: bool,
+        preview_size: tuple[int, int],
+        show_percentages: bool = False,
+        percentage_font_size: int = 24,
+        label_positions: dict[int, tuple[float, float]] | None = None,
+        text_colors: dict[int, str] | None = None,
+    ) -> Image.Image:
+        assert self.image is not None
+        preview_width, preview_height = preview_size
+        scale = min(
+            preview_width / self.image.width,
+            preview_height / self.image.height,
+            1.0,
+        )
+        size = (
+            max(1, round(self.image.width * scale)),
+            max(1, round(self.image.height * scale)),
+        )
+        scale_x = size[0] / self.image.width
+        scale_y = size[1] / self.image.height
+        preview_source = self.image.resize(size, Image.Resampling.LANCZOS)
+        preview_regions = [
+            Region(
+                region.name,
+                [(x * scale_x, y * scale_y) for x, y in region.points],
+                region.color,
+                region.opacity,
+                max(1, round(region.border_width * (scale_x + scale_y) / 2)),
+                region.visible,
+                region.percentage_base_index,
+                region.percentage_color,
+                (
+                    (region.percentage_label_position[0] * scale_x,
+                     region.percentage_label_position[1] * scale_y)
+                    if region.percentage_label_position is not None
+                    else None
+                ),
+            )
+            for region in self.regions
+        ]
+        preview_positions = {
+            index: (x * scale_x, y * scale_y)
+            for index, (x, y) in (label_positions or {}).items()
+        }
+        return make_region_export(
+            preview_source,
+            preview_regions,
+            selected_indices,
+            include_intersections=include_intersections,
+            crop_to_regions=crop_to_regions,
+            show_percentages=show_percentages,
+            percentage_font_size=max(1, round(percentage_font_size * (scale_x + scale_y) / 2)),
+            percentage_labels=_percentage_labels(self.image.size, self.regions),
+            label_positions=preview_positions,
+            text_colors=text_colors,
+        )
+
     def _choose_export_regions(
         self,
-    ) -> tuple[list[int], bool, bool] | None:
+    ) -> tuple[
+        list[int],
+        bool,
+        bool,
+        bool,
+        int,
+        dict[int, tuple[float, float]],
+        dict[int, str],
+    ] | None:
         if not self.regions:
-            return [], True, False
+            return [], True, False, False, 24, {}, {}
 
         dialog = tk.Toplevel(self.root)
         dialog.title(self._t("export_options_title"))
         dialog.transient(self.root)
-        dialog.resizable(False, False)
+        dialog.geometry("1120x720")
+        dialog.minsize(900, 560)
         dialog.grab_set()
         frame = ttk.Frame(dialog, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text=self._t("export_regions_prompt")).pack(anchor=tk.W)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
 
-        selected_vars = [tk.BooleanVar(value=True) for _ in self.regions]
-        regions_frame = ttk.Frame(frame)
+        controls = ttk.Frame(frame)
+        controls.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        ttk.Label(controls, text=self._t("export_regions_prompt")).pack(anchor=tk.W)
+
+        selected_vars = [
+            tk.BooleanVar(value=region.visible) for region in self.regions
+        ]
+        text_colors = {
+            index: region.percentage_color or region.color
+            for index, region in enumerate(self.regions)
+        }
+        label_positions = {
+            index: region.percentage_label_position
+            for index, region in enumerate(self.regions)
+            if region.percentage_label_position is not None
+        }
+        regions_frame = ttk.Frame(controls)
         regions_frame.pack(fill=tk.X, pady=(8, 12))
+        color_buttons: list[ttk.Button] = []
+
+        def choose_text_color(region_index: int) -> None:
+            selected_color = colorchooser.askcolor(
+                color=text_colors[region_index],
+                title=self._t("percentage_color"),
+                parent=dialog,
+            )[1]
+            if selected_color is not None:
+                text_colors[region_index] = selected_color.lower()
+                color_buttons[region_index].configure(
+                    text=f"{self._t('percentage_color')} {selected_color}"
+                )
+                schedule_preview()
+
         for index, (region, variable) in enumerate(zip(self.regions, selected_vars)):
             ttk.Checkbutton(
-                regions_frame, text=region.name, variable=variable
+                regions_frame,
+                text=region.name,
+                variable=variable,
+                state=tk.NORMAL if region.visible else tk.DISABLED,
             ).grid(row=index, column=0, sticky=tk.W, pady=2)
+            color_button = ttk.Button(
+                regions_frame,
+                text=(
+                    f"{self._t('percentage_color')} "
+                    f"{region.percentage_color or region.color}"
+                ),
+                command=lambda region_index=index: choose_text_color(region_index),
+                state=tk.NORMAL if region.visible else tk.DISABLED,
+            )
+            color_button.grid(row=index, column=1, sticky=tk.E, padx=(6, 0), pady=2)
+            color_buttons.append(color_button)
 
-        selection_buttons = ttk.Frame(frame)
+        selection_buttons = ttk.Frame(controls)
         selection_buttons.pack(fill=tk.X, pady=(0, 10))
 
+        include_intersections = tk.BooleanVar(value=True)
+        crop_to_regions = tk.BooleanVar(value=True)
+        show_percentages = tk.BooleanVar(value=False)
+        font_size_var = tk.StringVar(value="24")
+        preview_canvas = tk.Canvas(
+            frame,
+            background="#252525",
+            highlightthickness=1,
+            highlightbackground="#a0a0a0",
+        )
+        preview_canvas.grid(row=0, column=1, sticky="nsew")
+        preview_canvas.create_text(
+            350,
+            250,
+            text=self._t("export_preview"),
+            fill="white",
+            font=("", 14),
+        )
+        preview_photo: ImageTk.PhotoImage | None = None
+        preview_after_id: str | None = None
+        preview_state: dict[str, object] = {}
+
+        def update_preview() -> None:
+            nonlocal preview_photo
+            width = max(1, preview_canvas.winfo_width() - 16)
+            height = max(1, preview_canvas.winfo_height() - 16)
+            selected_indices = [
+                index
+                for index, variable in enumerate(selected_vars)
+                if variable.get()
+            ]
+            font_size = int(font_size_var.get())
+            preview = self._make_export_preview(
+                selected_indices,
+                include_intersections.get(),
+                crop_to_regions.get(),
+                (width, height),
+                show_percentages.get(),
+                font_size,
+                label_positions,
+                text_colors,
+            )
+            scale = min(width / self.image.width, height / self.image.height, 1.0)
+            source_size = (
+                max(1, round(self.image.width * scale)),
+                max(1, round(self.image.height * scale)),
+            )
+            scale_x = source_size[0] / self.image.width
+            scale_y = source_size[1] / self.image.height
+            preview_regions = [
+                Region(
+                    region.name,
+                    [(x * scale_x, y * scale_y) for x, y in region.points],
+                    region.color,
+                    region.opacity,
+                    max(1, round(region.border_width * (scale_x + scale_y) / 2)),
+                    region.visible,
+                )
+                for region in self.regions
+            ]
+            crop_bounds = _region_export_crop_bounds(
+                source_size, preview_regions, selected_indices, crop_to_regions.get()
+            )
+            preview_state.clear()
+            preview_state.update(
+                {
+                    "scale_x": scale_x,
+                    "scale_y": scale_y,
+                    "crop_bounds": crop_bounds,
+                    "preview_regions": preview_regions,
+                    "font_size": max(
+                        1, round(font_size * (scale_x + scale_y) / 2)
+                    ),
+                    "selected_indices": selected_indices,
+                    "labels": _percentage_labels(self.image.size, self.regions),
+                    "image_x": (preview_canvas.winfo_width() - preview.width) / 2,
+                    "image_y": (preview_canvas.winfo_height() - preview.height) / 2,
+                }
+            )
+            preview_photo = ImageTk.PhotoImage(preview)
+            preview_canvas.delete("all")
+            preview_canvas.create_image(
+                preview_canvas.winfo_width() / 2,
+                preview_canvas.winfo_height() / 2,
+                image=preview_photo,
+                anchor=tk.CENTER,
+            )
+            preview_canvas.image = preview_photo
+
+        def on_label_press(event: tk.Event) -> None:
+            if not show_percentages.get() or not preview_state:
+                return
+            bounds = preview_state.get("crop_bounds")
+            if bounds is None:
+                return
+            crop_left, crop_top, _, _ = bounds
+            local_x = event.x - float(preview_state["image_x"]) + crop_left
+            local_y = event.y - float(preview_state["image_y"]) + crop_top
+            scale_x = float(preview_state["scale_x"])
+            scale_y = float(preview_state["scale_y"])
+            regions = preview_state["preview_regions"]
+            labels = preview_state["labels"]
+            font = _percentage_font(int(preview_state["font_size"]))
+            draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+            for index in reversed(preview_state["selected_indices"]):
+                if not self.regions[index].visible or labels[index] is None:
+                    continue
+                region = regions[index]
+                position = (
+                    (label_positions.get(index) or self.regions[index].percentage_label_position)
+                )
+                if position is not None:
+                    position = (position[0] * scale_x, position[1] * scale_y)
+                else:
+                    position = _default_percentage_label_position(
+                        (
+                            max(1, round(self.image.width * scale_x)),
+                            max(1, round(self.image.height * scale_y)),
+                        ),
+                        region,
+                        font,
+                        labels[index],
+                    )
+                text_bounds = draw.textbbox(position, labels[index], font=font)
+                preview_bounds = (
+                    text_bounds[0] - crop_left,
+                    text_bounds[1] - crop_top,
+                    text_bounds[2] - crop_left,
+                    text_bounds[3] - crop_top,
+                )
+                if (
+                    preview_bounds[0] <= event.x - float(preview_state["image_x"]) <= preview_bounds[2]
+                    and preview_bounds[1] <= event.y - float(preview_state["image_y"]) <= preview_bounds[3]
+                ):
+                    preview_state["dragging_label"] = index
+                    return
+
+        def on_label_drag(event: tk.Event) -> None:
+            index = preview_state.get("dragging_label")
+            bounds = preview_state.get("crop_bounds")
+            if index is None or bounds is None:
+                return
+            crop_left, crop_top, _, _ = bounds
+            label_positions[int(index)] = (
+                max(
+                    0.0,
+                    min(
+                        self.image.width - 1.0,
+                        (event.x - float(preview_state["image_x"]) + crop_left)
+                        / float(preview_state["scale_x"]),
+                    ),
+                ),
+                max(
+                    0.0,
+                    min(
+                        self.image.height - 1.0,
+                        (event.y - float(preview_state["image_y"]) + crop_top)
+                        / float(preview_state["scale_y"]),
+                    ),
+                ),
+            )
+            schedule_preview()
+
+        def on_label_release(_event: tk.Event) -> None:
+            preview_state.pop("dragging_label", None)
+
+        def schedule_preview(*_args: object) -> None:
+            nonlocal preview_after_id
+            if preview_after_id is not None:
+                dialog.after_cancel(preview_after_id)
+            preview_after_id = dialog.after(80, update_preview)
+
+        for variable in selected_vars:
+            variable.trace_add("write", schedule_preview)
+
         def set_all(value: bool) -> None:
-            for variable in selected_vars:
-                variable.set(value)
+            for region, variable in zip(self.regions, selected_vars):
+                if region.visible:
+                    variable.set(value)
 
         ttk.Button(
             selection_buttons,
@@ -1561,20 +2249,54 @@ class ImageAnalyzerApp:
             selection_buttons, text=self._t("select_none"), command=lambda: set_all(False)
         ).pack(side=tk.LEFT)
 
-        include_intersections = tk.BooleanVar(value=True)
-        crop_to_regions = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            frame,
+            controls,
             text=self._t("include_intersections"),
             variable=include_intersections,
+            command=schedule_preview,
         ).pack(anchor=tk.W)
         ttk.Checkbutton(
-            frame,
+            controls,
             text=self._t("crop_export"),
             variable=crop_to_regions,
+            command=schedule_preview,
         ).pack(anchor=tk.W, pady=(4, 12))
+        ttk.Checkbutton(
+            controls,
+            text=self._t("show_percentages"),
+            variable=show_percentages,
+            command=schedule_preview,
+        ).pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(controls, text=self._t("percentage_font_size")).pack(anchor=tk.W)
+        font_size_combo = ttk.Combobox(
+            controls,
+            textvariable=font_size_var,
+            values=tuple(str(value) for value in range(12, 49, 4)),
+            state="readonly",
+            width=8,
+        )
+        font_size_combo.pack(anchor=tk.W, pady=(2, 10))
+        font_size_var.trace_add("write", schedule_preview)
+        preview_canvas.bind("<ButtonPress-1>", on_label_press)
+        preview_canvas.bind("<B1-Motion>", on_label_drag)
+        preview_canvas.bind("<ButtonRelease-1>", on_label_release)
+        include_intersections.trace_add("write", schedule_preview)
+        crop_to_regions.trace_add("write", schedule_preview)
+        preview_canvas.bind("<Configure>", schedule_preview)
 
-        result: dict[str, tuple[list[int], bool, bool] | None] = {"value": None}
+        result: dict[
+            str,
+            tuple[
+                list[int],
+                bool,
+                bool,
+                bool,
+                int,
+                dict[int, tuple[float, float]],
+                dict[int, str],
+            ]
+            | None,
+        ] = {"value": None}
 
         def accept() -> None:
             indices = [
@@ -1591,11 +2313,15 @@ class ImageAnalyzerApp:
                 indices,
                 include_intersections.get(),
                 crop_to_regions.get(),
+                show_percentages.get(),
+                int(font_size_var.get()),
+                label_positions,
+                text_colors,
             )
             dialog.destroy()
 
         buttons = ttk.Frame(frame)
-        buttons.pack(fill=tk.X)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(
             buttons, text=self._t("cancel"), command=dialog.destroy
         ).pack(side=tk.RIGHT)
@@ -1603,6 +2329,8 @@ class ImageAnalyzerApp:
             buttons, text=self._t("continue"), command=accept
         ).pack(side=tk.RIGHT, padx=(0, 6))
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        update_preview()
         dialog.wait_window()
         return result["value"]
 
@@ -1613,7 +2341,15 @@ class ImageAnalyzerApp:
         options = self._choose_export_regions()
         if options is None:
             return
-        selected_indices, include_intersections, crop_to_regions = options
+        (
+            selected_indices,
+            include_intersections,
+            crop_to_regions,
+            show_percentages,
+            percentage_font_size,
+            label_positions,
+            text_colors,
+        ) = options
         path = filedialog.asksaveasfilename(
             title=self._t("image_export_title"),
             defaultextension=".png",
@@ -1628,12 +2364,24 @@ class ImageAnalyzerApp:
             selected_indices,
             include_intersections=include_intersections,
             crop_to_regions=crop_to_regions,
+            show_percentages=show_percentages,
+            percentage_font_size=percentage_font_size,
+            percentage_labels=_percentage_labels(self.image.size, self.regions),
+            label_positions=label_positions,
+            text_colors=text_colors,
         )
         try:
             result.save(path, dpi=(dpi, dpi))
         except (OSError, ValueError) as exc:
             messagebox.showerror(self._t("export_error"), str(exc))
             return
+        for index in selected_indices:
+            self.regions[index].percentage_color = text_colors.get(
+                index,
+                self.regions[index].percentage_color or self.regions[index].color,
+            )
+            if index in label_positions:
+                self.regions[index].percentage_label_position = label_positions[index]
         self.status_var.set(
             self._t(
                 "image_saved",
@@ -1673,6 +2421,7 @@ class ImageAnalyzerApp:
             [
                 self._t("excel_region"),
                 self._t("excel_region_area"),
+                self._t("excel_region_base"),
                 self._t("excel_base_share"),
                 self._t("excel_color"),
             ]
@@ -1681,16 +2430,18 @@ class ImageAnalyzerApp:
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="D9EAF7")
         for region, area in zip(self.regions, self.region_areas):
-            percentage = calculate_area_percentage(area, base_pixels)
+            region_base_pixels = self._region_base_area_pixels(region)
+            percentage = calculate_area_percentage(area, region_base_pixels)
             sheet.append(
                 [
                     region.name,
                     area,
+                    self._region_base_area_label(region),
                     None if percentage is None else round(percentage, 4),
                     region.color,
                 ]
             )
-            sheet.cell(sheet.max_row, 4).fill = PatternFill(
+            sheet.cell(sheet.max_row, 5).fill = PatternFill(
                 "solid", fgColor=region.color.lstrip("#")
             )
 
@@ -1714,7 +2465,8 @@ class ImageAnalyzerApp:
         sheet.column_dimensions["A"].width = 54
         sheet.column_dimensions["B"].width = 24
         sheet.column_dimensions["C"].width = 24
-        sheet.column_dimensions["D"].width = 14
+        sheet.column_dimensions["D"].width = 24
+        sheet.column_dimensions["E"].width = 14
         try:
             workbook.save(path)
         except (OSError, ValueError) as exc:

@@ -15,6 +15,7 @@ from app import (
     calculate_region_areas,
     make_annotated_image,
     make_region_export,
+    _percentage_labels,
     save_project_file,
     load_project_file,
 )
@@ -114,6 +115,86 @@ class RegionAreaTests(unittest.TestCase):
         self.assertEqual(result.size, source.size)
         self.assertNotEqual(result.getpixel((4, 3)), source.getpixel((4, 3)))
 
+    def test_hidden_region_is_not_rendered_but_remains_in_area_calculation(self) -> None:
+        source = Image.new("RGB", (12, 12), "white")
+        region = Region(
+            "Hidden",
+            [(1, 1), (8, 1), (8, 8), (1, 8)],
+            "#ff0000",
+            visible=False,
+        )
+
+        result = make_annotated_image(source, [region])
+        areas, union_area = calculate_region_areas(source.size, [region])
+
+        self.assertEqual(result.getpixel((4, 4)), (255, 255, 255))
+        self.assertEqual(areas, [64])
+        self.assertEqual(union_area, 64)
+
+    def test_region_export_omits_hidden_regions_and_does_not_crop_to_them(self) -> None:
+        source = Image.new("RGB", (24, 24), "#dddddd")
+        hidden = Region(
+            "Hidden",
+            [(8, 8), (16, 8), (16, 16), (8, 16)],
+            "#00ff00",
+            opacity=100,
+            visible=False,
+        )
+
+        result = make_region_export(source, [hidden], [0])
+
+        self.assertEqual(result.size, source.size)
+        self.assertEqual(result.getpixel((12, 12)), (221, 221, 221))
+
+    def test_export_preview_uses_selected_regions_and_fits_large_image(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (1200, 600), "#dddddd")
+        app.regions = [
+            Region(
+                "Selected",
+                [(120, 60), (360, 60), (360, 300), (120, 300)],
+                "#ff0000",
+                opacity=100,
+            ),
+            Region(
+                "Not selected",
+                [(720, 60), (1080, 60), (1080, 420), (720, 420)],
+                "#00ff00",
+                opacity=100,
+            ),
+        ]
+
+        preview = app._make_export_preview(
+            [0], include_intersections=True, crop_to_regions=False, preview_size=(400, 300)
+        )
+
+        self.assertEqual(preview.size, (400, 200))
+        self.assertEqual(preview.getpixel((80, 60)), (255, 0, 0))
+        self.assertEqual(preview.getpixel((300, 100)), (221, 221, 221))
+
+    def test_export_preview_crops_according_to_current_option(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (100, 100), "white")
+        app.regions = [
+            Region(
+                "Selected",
+                [(20, 20), (80, 20), (80, 80), (20, 80)],
+                "#0000ff",
+                opacity=100,
+            )
+        ]
+
+        preview = app._make_export_preview(
+            [0], include_intersections=True, crop_to_regions=True, preview_size=(300, 300)
+        )
+
+        self.assertLess(preview.width, 100)
+        self.assertLess(preview.height, 100)
+
     def test_region_export_crops_to_selected_regions_and_preserves_source_background(self) -> None:
         source = Image.new("RGB", (24, 24), "#dddddd")
         region = Region(
@@ -154,6 +235,67 @@ class RegionAreaTests(unittest.TestCase):
         self.assertEqual(result.getpixel((5, 5)), (255, 0, 0))
         self.assertEqual(result.getpixel((18, 18)), (0, 255, 0))
 
+    def test_percentage_labels_use_individual_bases_and_custom_color_and_position(self) -> None:
+        source = Image.new("RGB", (80, 80), "white")
+        regions = [
+            Region(
+                "Base",
+                [(5, 5), (54, 5), (54, 54), (5, 54)],
+                "#ff0000",
+                percentage_base_index=0,
+            ),
+            Region(
+                "Small",
+                [(15, 15), (24, 15), (24, 24), (15, 24)],
+                "#0000ff",
+                percentage_base_index=0,
+            ),
+        ]
+
+        self.assertEqual(_percentage_labels(source.size, regions), ["100.00%", "4.00%"])
+        result = make_region_export(
+            source,
+            regions,
+            [0],
+            crop_to_regions=False,
+            show_percentages=True,
+            percentage_font_size=20,
+            label_positions={0: (30, 30)},
+            text_colors={0: "#00ff00"},
+        )
+
+        self.assertTrue(
+            any(
+                green > red and green > blue
+                for red, green, blue in result.crop((30, 30, 55, 55)).getdata()
+            )
+        )
+
+    def test_export_preview_renders_percentage_labels_at_preview_scale(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.image = Image.new("RGB", (200, 100), "white")
+        app.regions = [
+            Region(
+                "A",
+                [(10, 10), (100, 10), (100, 80), (10, 80)],
+                "#ff0000",
+            )
+        ]
+
+        preview = app._make_export_preview(
+            [0],
+            include_intersections=True,
+            crop_to_regions=False,
+            preview_size=(100, 100),
+            show_percentages=True,
+            percentage_font_size=24,
+        )
+
+        self.assertEqual(preview.size, (100, 50))
+        self.assertNotEqual(preview, Image.new("RGB", preview.size, "white"))
+
 
 class ProjectFileTests(unittest.TestCase):
     def test_project_round_trip_preserves_regions_and_resolves_relative_image_path(self) -> None:
@@ -171,6 +313,10 @@ class ProjectFileTests(unittest.TestCase):
                     "#aabbcc",
                     opacity=63,
                     border_width=5,
+                    percentage_base_index=0,
+                    percentage_color="#123456",
+                    percentage_label_position=(9.5, 10.5),
+                    visible=False,
                 )
             ]
 
@@ -187,6 +333,34 @@ class ProjectFileTests(unittest.TestCase):
             self.assertEqual(dpi, 500)
             self.assertEqual(language, "sr")
 
+    def test_legacy_project_base_is_migrated_to_each_region(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "base.png"
+            project_path = root / "analysis.json"
+            image = Image.new("RGB", (12, 12), "white")
+            image.save(image_path)
+            regions = [
+                Region("A", [(1, 1), (5, 1), (5, 5)], "#ff0000"),
+                Region("B", [(2, 2), (6, 2), (6, 6)], "#00ff00"),
+            ]
+            save_project_file(
+                project_path, image_path, image, regions, 1, 300, "ru"
+            )
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            for item in payload["regions"]:
+                item.pop("percentage_base_index")
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded_regions = load_project_file(project_path)[2]
+
+            self.assertEqual(
+                [region.percentage_base_index for region in loaded_regions],
+                [1, 1],
+            )
+
     def test_invalid_project_version_is_rejected(self) -> None:
         import json
 
@@ -202,6 +376,24 @@ class ProjectFileTests(unittest.TestCase):
 
 
 class AppBehaviorTests(unittest.TestCase):
+    def test_region_selection_sync_does_not_call_listbox_api_on_frame_container(self) -> None:
+        from tkinter import ttk
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.region_list = Mock(spec=ttk.Frame)
+        app.region_row_labels = []
+        app.selected_index = None
+        app.root = Mock()
+        app.root.cget.return_value = "#f0f0f0"
+
+        self.assertTrue(hasattr(app.region_list, "selection_clear"))
+        self.assertFalse(hasattr(app.region_list, "curselection"))
+
+        app._sync_region_list_selection()
+
+        app.region_list.selection_clear.assert_not_called()
+
     def test_starting_new_lasso_deselects_previous_region_until_new_region_exists(self) -> None:
         from app import ImageAnalyzerApp
 
@@ -396,7 +588,9 @@ class AppBehaviorTests(unittest.TestCase):
                     opacity=100,
                 ),
             ]
-            app._choose_export_regions = Mock(return_value=([1], False, True))
+            app._choose_export_regions = Mock(
+                return_value=([1], False, True, False, 24, {}, {})
+            )
             app.dpi_var = Mock()
             app.dpi_var.get.return_value = "300"
             app.status_var = Mock()
@@ -432,7 +626,8 @@ class AppBehaviorTests(unittest.TestCase):
             self.assertEqual(sheet["B3"].value, 100)
             self.assertEqual(sheet["B4"].value, "Всё изображение")
             self.assertEqual(sheet["A7"].value, "A")
-            self.assertEqual(sheet["C7"].value, 25)
+            self.assertEqual(sheet["C7"].value, "Всё изображение")
+            self.assertEqual(sheet["D7"].value, 25)
             workbook.close()
 
     def test_excel_export_uses_the_selected_language(self) -> None:
@@ -996,8 +1191,8 @@ class AppBehaviorTests(unittest.TestCase):
         app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
         app.image = Image.new("RGB", (10, 10), "white")
         app.regions = [
-            Region("Base", [], "#ff0000"),
-            Region("Other", [], "#00ff00"),
+            Region("Base", [], "#ff0000", percentage_base_index=0),
+            Region("Other", [], "#00ff00", percentage_base_index=0),
         ]
         app.region_areas = [25, 10]
         app.union_area = 30
@@ -1010,11 +1205,63 @@ class AppBehaviorTests(unittest.TestCase):
 
         summary = app.summary_label.configure.call_args.kwargs["text"]
         stats = app.stats_label.configure.call_args.kwargs["text"]
-        self.assertIn("Base (25 px²)", summary)
-        self.assertIn("Сумма областей (с наложениями): 140.00%", summary)
-        self.assertIn("Объединение (без наложений): 120.00%", summary)
-        self.assertIn("Base: 100.00% (25 px²)", stats)
-        self.assertIn("Other: 40.00% (10 px²)", stats)
+        self.assertIn("Всё изображение (100 px²)", summary)
+        self.assertIn("Сумма областей (с наложениями): 35.00%", summary)
+        self.assertIn("Объединение (без наложений): 30.00%", summary)
+        self.assertIn("Base: 100.00% от Область 1: Base (25 px²)", stats)
+        self.assertIn("Other: 40.00% от Область 1: Base (10 px²)", stats)
+
+    def test_region_base_selector_changes_only_its_region_basis(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.regions = [
+            Region("A", [], "#ff0000"),
+            Region("B", [], "#00ff00"),
+        ]
+        app.region_base_options = [
+            {"Всё изображение": None, "Область 2: B": 1},
+            {"Всё изображение": None, "Область 1: A": 0},
+        ]
+        app.region_base_vars = [Mock(), Mock()]
+        app.region_base_vars[0].get.return_value = "Область 2: B"
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+
+        app._on_region_base_change(0)
+
+        self.assertEqual(app.regions[0].percentage_base_index, 1)
+        self.assertIsNone(app.regions[1].percentage_base_index)
+        app._update_statistics.assert_called_once()
+        app._refresh_regions.assert_called_once()
+
+    def test_deleting_region_updates_per_region_percentage_base_indices(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.regions = [
+            Region("A", [], "#ff0000", percentage_base_index=1),
+            Region("B", [], "#00ff00", percentage_base_index=2),
+            Region("C", [], "#0000ff", percentage_base_index=2),
+        ]
+        app.selected_index = 1
+        app.base_region_index = None
+        app.drawing = False
+        app.delete_vertex_mode = False
+        app._sync_region_controls = Mock()
+        app._update_statistics = Mock()
+        app._refresh_regions = Mock()
+        app._render = Mock()
+        app.status_var = Mock()
+
+        app.delete_selected_region()
+
+        self.assertEqual(
+            [region.percentage_base_index for region in app.regions],
+            [None, 1],
+        )
+        self.assertEqual(app.selected_index, 1)
+        app._update_statistics.assert_called_once()
 
     def test_clicking_active_region_in_list_deselects_it(self) -> None:
         from app import ImageAnalyzerApp
@@ -1038,7 +1285,7 @@ class AppBehaviorTests(unittest.TestCase):
         app._sync_region_controls = Mock()
         app._render = Mock()
 
-        result = app._on_region_click(SimpleNamespace(x=10, y=10))
+        result = app._on_region_click(SimpleNamespace(x=40, y=10))
 
         self.assertEqual(result, "break")
         self.assertIsNone(app.selected_index)
@@ -1069,7 +1316,7 @@ class AppBehaviorTests(unittest.TestCase):
         app._sync_region_controls = Mock()
         app._render = Mock()
 
-        result = app._on_region_click(SimpleNamespace(x=10, y=30))
+        result = app._on_region_click(SimpleNamespace(x=40, y=30))
 
         self.assertEqual(result, "break")
         self.assertEqual(app.selected_index, 1)
@@ -1202,12 +1449,38 @@ class AppBehaviorTests(unittest.TestCase):
         app._sync_region_controls = Mock()
         app._render = Mock()
 
-        app._on_region_click(SimpleNamespace(x=10, y=30))
+        app._on_region_click(SimpleNamespace(x=40, y=30))
 
         self.assertEqual(app.selected_index, 1)
         self.assertIsNone(app.hovered_vertex)
         self.assertIsNone(app.selected_vertex)
-        app.region_list.index.assert_called_once_with("@10,30")
+        app.region_list.index.assert_called_once_with("@40,30")
+
+    def test_eye_icon_toggles_layer_visibility_without_selecting_row(self) -> None:
+        from app import ImageAnalyzerApp
+
+        app = ImageAnalyzerApp.__new__(ImageAnalyzerApp)
+        app.regions = [
+            Region("Layer", [(1, 1), (8, 1), (8, 8)], "#ff0000")
+        ]
+        app.selected_index = None
+        app.delete_vertex_mode = False
+        app.region_list = Mock()
+        app.region_list.index.return_value = 0
+        app.region_list.bbox.return_value = (0, 0, 120, 20)
+        app.status_var = Mock()
+        app._refresh_regions = Mock()
+        app._render = Mock()
+
+        result = app._on_region_click(SimpleNamespace(x=12, y=10))
+
+        self.assertEqual(result, "break")
+        self.assertFalse(app.regions[0].visible)
+        self.assertIsNone(app.selected_index)
+        app.region_list.selection_set.assert_not_called()
+        app._refresh_regions.assert_called_once()
+        app._render.assert_called_once()
+        app.status_var.set.assert_called_once_with("Область «Layer» скрыта.")
 
     def test_clicking_empty_space_below_regions_clears_selection(self) -> None:
         from app import ImageAnalyzerApp
